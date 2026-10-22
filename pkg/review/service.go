@@ -22,10 +22,13 @@ import (
 
 type Library interface {
 	SearchOriginalFilename(context.Context, string) ([]immich.ReviewAsset, error)
+	SearchTakenRange(context.Context, time.Time, time.Time, bool) ([]immich.ReviewAsset, error)
 	GetAlbums(context.Context) ([]immich.Album, error)
 	CreateReviewAlbum(context.Context, string) (string, error)
 	AddReviewAssets(context.Context, string, []string) ([]string, error)
 }
+
+const dateFallbackTolerance = 2 * time.Hour
 
 type Candidate struct {
 	ID         string     `json:"id"`
@@ -90,6 +93,11 @@ func (s *Service) Preview(ctx context.Context, album *googlephotos.Album, client
 	}
 	session := &Session{ID: hex.EncodeToString(id), Title: album.Title, CreatedAt: time.Now().UTC(), Target: target, Status: "ready", Items: []Item{}}
 	cache := map[string][]immich.ReviewAsset{}
+	type dateKey struct {
+		TakenAt time.Time
+		IsVideo bool
+	}
+	dateCache := map[dateKey][]immich.ReviewAsset{}
 	seen := map[string]bool{}
 	for _, photo := range album.Photos {
 		if photo.ID == "" || seen[photo.ID] {
@@ -126,6 +134,39 @@ func (s *Service) Preview(ctx context.Context, album *googlephotos.Album, client
 			item.Status = item.Candidates[0].DateStatus
 		} else if len(item.Candidates) > 1 {
 			item.Status = "ambiguous"
+		}
+		if len(item.Candidates) == 0 && !photo.TakenAt.IsZero() {
+			key := dateKey{TakenAt: photo.TakenAt.UTC(), IsVideo: photo.IsVideo}
+			alternatives, cached := dateCache[key]
+			if !cached {
+				var err error
+				alternatives, err = client.SearchTakenRange(ctx, photo.TakenAt.Add(-dateFallbackTolerance), photo.TakenAt.Add(dateFallbackTolerance), photo.IsVideo)
+				if err != nil {
+					return nil, fmt.Errorf("Immich capture date search failed: %w", err)
+				}
+				dateCache[key] = alternatives
+			}
+			seenAssets := map[string]bool{}
+			for _, asset := range alternatives {
+				taken := asset.TakenAt()
+				if asset.ID == "" || seenAssets[asset.ID] || taken.IsZero() || taken.Sub(photo.TakenAt).Abs() > dateFallbackTolerance {
+					continue
+				}
+				seenAssets[asset.ID] = true
+				item.Candidates = append(item.Candidates, Candidate{ID: asset.ID, Filename: asset.OriginalFileName, TakenAt: instant(taken), DateStatus: "nearby_date"})
+			}
+			sort.Slice(item.Candidates, func(i, j int) bool {
+				di := item.Candidates[i].TakenAt.Sub(photo.TakenAt).Abs()
+				dj := item.Candidates[j].TakenAt.Sub(photo.TakenAt).Abs()
+				if di == dj {
+					return item.Candidates[i].ID < item.Candidates[j].ID
+				}
+				return di < dj
+			})
+			if len(item.Candidates) > 0 {
+				item.Status = "date_suggestions"
+				item.Warning = "No exact filename match. These alternatives were taken within ±2 hours. Check the previews and select a photo manually."
+			}
 		}
 		session.Items = append(session.Items, item)
 	}

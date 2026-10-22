@@ -79,10 +79,20 @@ docker compose --env-file dev/.env -f dev/compose.yml down
   di caricamento `createdAt` non è usato.
 - Tolleranza di un secondo per la precisione dei metadati.
 - Se manca una data, il candidato rimane visibile come **Check date**.
-- Il primo candidato visualizzato è sempre preselezionato, anche con data
-  diversa, data assente o più risultati. Le corrispondenze con la stessa data
+- Per le corrispondenze per nome, il primo candidato visualizzato è
+  preselezionato, anche con data diversa, data assente o più risultati.
+  Le corrispondenze con la stessa data
   vengono mostrate per prime. Si può scegliere un altro candidato o escludere
-  la foto prima della conferma. Le foto senza candidati rimangono escluse.
+  la foto prima della conferma.
+- Se la ricerca per nome non trova candidati e Google fornisce la data di
+  scatto, viene eseguita una seconda ricerca nell'intervallo inclusivo di
+  **±2 ore**. Le alternative possono avere nomi diversi e sono ordinate per
+  vicinanza all'istante originale, confrontando i fusi orari correttamente.
+  Foto e video vengono cercati separatamente. La UI le contrassegna come
+  **Date alternatives (±2 hours)** e richiede di selezionarle manualmente:
+  non sono preselezionate, nemmeno quando esiste un solo candidato.
+  La ricerca legge tutte le pagine Immich e non modifica la libreria.
+  Le foto senza candidati rimangono escluse.
 - I nomi vengono letti con HEAD e Content-Disposition; nessun originale viene
   scaricato. Per i video si usa la variante `=dv`. Formati senza intestazione
   utilizzabile restano indicati come **Filename unavailable**.

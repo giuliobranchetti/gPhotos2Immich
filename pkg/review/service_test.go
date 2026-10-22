@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +19,17 @@ type library struct {
 	albums                  []immich.Album
 	creates, adds, searches int
 	createErr, addErr       error
+	dateAssets              []immich.ReviewAsset
+	dateSearches            int
+	dateErr                 error
+	dateAfter, dateBefore   time.Time
+	dateIsVideo             bool
+}
+
+func (l *library) SearchTakenRange(_ context.Context, after, before time.Time, isVideo bool) ([]immich.ReviewAsset, error) {
+	l.dateSearches++
+	l.dateAfter, l.dateBefore, l.dateIsVideo = after, before, isVideo
+	return l.dateAssets, l.dateErr
 }
 
 func (l *library) SearchOriginalFilename(_ context.Context, n string) ([]immich.ReviewAsset, error) {
@@ -79,6 +92,81 @@ func TestPreviewClassificationsAndReadOnly(t *testing.T) {
 	}
 	if len(p.Items[1].Candidates) != 1 {
 		t.Fatal("mismatched date candidate was hidden")
+	}
+}
+
+func TestPreviewSuggestsNearbyDatesOnlyAfterFilenameMiss(t *testing.T) {
+	source := time.Date(2020, 1, 2, 0, 30, 0, 0, time.FixedZone("UTC+2", 7200))
+	l := &library{
+		assets: map[string][]immich.ReviewAsset{
+			"exact.jpg": {asset("filename-match", "exact.jpg", source.AddDate(-1, 0, 0))},
+			// Partial filename matches must not prevent the date fallback.
+			"missing.jpg": {asset("wrong-name", "other.jpg", source)},
+		},
+		dateAssets: []immich.ReviewAsset{
+			asset("upper", "upper.jpg", source.Add(2*time.Hour)),
+			asset("outside", "outside.jpg", source.Add(2*time.Hour+time.Nanosecond)),
+			asset("unknown", "unknown.jpg", time.Time{}),
+			asset("near", "near.jpg", source.Add(30*time.Minute)),
+			asset("lower", "lower.jpg", source.Add(-2*time.Hour)),
+			asset("exact", "renamed.jpg", source.UTC()),
+			asset("near", "near.jpg", source.Add(30*time.Minute)),
+			asset("", "empty-id.jpg", source),
+		},
+	}
+	s := New(t.TempDir())
+	photos := []googlephotos.Photo{
+		{ID: "filename", OriginalFileName: "exact.jpg", TakenAt: source},
+		{ID: "missing", OriginalFileName: "missing.jpg", TakenAt: source},
+		{ID: "same-time", OriginalFileName: "another-missing.jpg", TakenAt: source.UTC()},
+		{ID: "no-time", OriginalFileName: "no-time.jpg"},
+		{ID: "no-name", TakenAt: source},
+	}
+	p, err := s.Preview(context.Background(), &googlephotos.Album{Title: "Trip", Photos: photos}, l, "target")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l.dateSearches != 1 || !l.dateAfter.Equal(source.Add(-2*time.Hour)) || !l.dateBefore.Equal(source.Add(2*time.Hour)) || l.dateIsVideo {
+		t.Fatalf("unexpected date searches: %+v", l)
+	}
+	if p.Items[0].Status != "date_mismatch" || p.Items[0].Candidates[0].ID != "filename-match" {
+		t.Fatal("filename match was replaced with date suggestions")
+	}
+	for _, i := range []int{1, 2} {
+		item := p.Items[i]
+		ids := []string{}
+		for _, c := range item.Candidates {
+			ids = append(ids, c.ID)
+			if c.DateStatus != "nearby_date" {
+				t.Fatalf("unmarked date alternative: %+v", c)
+			}
+		}
+		if item.Status != "date_suggestions" || item.Warning == "" || !reflect.DeepEqual(ids, []string{"exact", "near", "lower", "upper"}) {
+			t.Fatalf("incorrect alternatives: %+v", item)
+		}
+	}
+	if p.Items[3].Status != "missing" || p.Items[4].Status != "filename_unavailable" {
+		t.Fatal("searched without a source date or filename")
+	}
+	if l.creates != 0 || l.adds != 0 {
+		t.Fatal("date preview wrote to Immich")
+	}
+	// The alternatives are persisted and can be selected after a restart.
+	p, err = New(s.Dir).Confirm(context.Background(), p.ID, "target", "Trip", map[string]string{"missing": "near"}, l)
+	if err != nil || p.Status != "complete" || l.creates != 1 || l.adds != 1 {
+		t.Fatalf("date alternative could not be confirmed: %+v %v", p, err)
+	}
+}
+
+func TestPreviewDateFallbackDistinguishesVideosAndFailsOnSearchError(t *testing.T) {
+	for _, isVideo := range []bool{false, true} {
+		t.Run(fmt.Sprint(isVideo), func(t *testing.T) {
+			l := &library{dateErr: errors.New("date search unavailable")}
+			p, err := New(t.TempDir()).Preview(context.Background(), &googlephotos.Album{Photos: []googlephotos.Photo{{ID: "missing", OriginalFileName: "missing", TakenAt: taken, IsVideo: isVideo}}}, l, "target")
+			if err == nil || !strings.Contains(err.Error(), "date search unavailable") || p != nil || l.dateSearches != 1 || l.dateIsVideo != isVideo {
+				t.Fatalf("incorrect fallback failure: %+v %v", p, err)
+			}
+		})
 	}
 }
 func TestConfirmSurvivesRestartAndRepeatedClicks(t *testing.T) {

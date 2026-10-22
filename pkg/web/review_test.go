@@ -112,6 +112,80 @@ func TestReviewCancelAndSyncDisabled(t *testing.T) {
 		t.Fatal("review mode did not serve review UI")
 	}
 }
+
+func TestReviewDateFallbackCanBePreviewedAndConfirmed(t *testing.T) {
+	taken := time.Date(2024, 1, 2, 0, 30, 0, 0, time.FixedZone("UTC+2", 7200))
+	searches, creates, adds := 0, 0, 0
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "POST /api/search/metadata":
+			searches++
+			var query map[string]any
+			json.NewDecoder(r.Body).Decode(&query)
+			if query["originalFileName"] == "google-name.jpg" {
+				io.WriteString(w, `{"assets":{"items":[],"nextPage":null}}`)
+				return
+			}
+			if query["takenAfter"] != taken.Add(-2*time.Hour).UTC().Format(time.RFC3339Nano) || query["takenBefore"] != taken.Add(2*time.Hour).UTC().Format(time.RFC3339Nano) || query["type"] != "IMAGE" {
+				t.Errorf("incorrect date search: %v", query)
+			}
+			json.NewEncoder(w).Encode(map[string]any{"assets": map[string]any{"items": []map[string]any{
+				{"id": "nearby", "type": "IMAGE", "originalFileName": "immich-name.jpg", "fileCreatedAt": taken.Add(time.Hour)},
+				{"id": "outside", "type": "IMAGE", "originalFileName": "outside.jpg", "fileCreatedAt": taken.Add(3 * time.Hour)},
+			}}})
+		case "GET /api/assets/nearby/thumbnail":
+			w.Header().Set("Content-Type", "image/png")
+			io.WriteString(w, "preview")
+		case "GET /api/albums":
+			io.WriteString(w, `[]`)
+		case "POST /api/albums":
+			creates++
+			io.WriteString(w, `{"id":"new-album"}`)
+		case "PUT /api/albums/new-album/assets":
+			adds++
+			var request struct {
+				IDs []string `json:"ids"`
+			}
+			json.NewDecoder(r.Body).Decode(&request)
+			if len(request.IDs) != 1 || request.IDs[0] != "nearby" {
+				t.Errorf("unexpected selected alternatives: %v", request.IDs)
+			}
+			io.WriteString(w, `[{"id":"nearby","success":true}]`)
+		default:
+			t.Errorf("unexpected operation %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", 400)
+		}
+	}))
+	defer fake.Close()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	if err := os.WriteFile(path, []byte(`{"apiURL":"`+fake.URL+`/api","apiKey":"test-key","dataDir":"`+filepath.ToSlash(dir)+`"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(path)
+	s.ReviewOnly = true
+	s.readAlbum = func(context.Context, string) (*googlephotos.Album, error) {
+		return &googlephotos.Album{Title: "Trip", Photos: []googlephotos.Photo{{ID: "google-1", OriginalFileName: "google-name.jpg", TakenAt: taken}}}, nil
+	}
+	w := reviewRequest(t, s, "POST", "/api/review/preview", `{"url":"https://photos.app.goo.gl/test"}`)
+	var session review.Session
+	if err := json.Unmarshal(w.Body.Bytes(), &session); err != nil || w.Code != 200 || searches != 2 || creates != 0 || adds != 0 {
+		t.Fatalf("date preview failed or wrote to Immich: %d %s", w.Code, w.Body)
+	}
+	if len(session.Items) != 1 || session.Items[0].Status != "date_suggestions" || len(session.Items[0].Candidates) != 1 || session.Items[0].Candidates[0].ID != "nearby" {
+		t.Fatalf("wrong date alternatives: %+v", session.Items)
+	}
+	if w := reviewRequest(t, s, "GET", "/api/review/thumbnail?session="+session.ID+"&asset=nearby", ""); w.Code != 200 {
+		t.Fatalf("date alternative thumbnail rejected: %d %s", w.Code, w.Body)
+	}
+	if w := reviewRequest(t, s, "GET", "/api/review/thumbnail?session="+session.ID+"&asset=outside", ""); w.Code != 404 {
+		t.Fatalf("out-of-range thumbnail allowed: %d", w.Code)
+	}
+	w = reviewRequest(t, s, "POST", "/api/review/confirm", `{"id":"`+session.ID+`","title":"Trip","selected":{"google-1":"nearby"}}`)
+	if w.Code != 200 || creates != 1 || adds != 1 {
+		t.Fatalf("date alternative confirmation failed: %d %s", w.Code, w.Body)
+	}
+}
 func TestReviewRefusesCrossOriginAndFormPosts(t *testing.T) {
 	s := NewServer("unused")
 	for _, tc := range []struct{ origin, ct string }{{"https://evil.test", "application/json"}, {"", "application/x-www-form-urlencoded"}} {

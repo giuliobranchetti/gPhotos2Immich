@@ -13,6 +13,7 @@ import (
 
 type ReviewAsset struct {
 	ID               string    `json:"id"`
+	Type             string    `json:"type"`
 	OriginalFileName string    `json:"originalFileName"`
 	FileCreatedAt    time.Time `json:"fileCreatedAt"`
 	ExifInfo         *struct {
@@ -31,12 +32,7 @@ func (a ReviewAsset) TakenAt() time.Time {
 // SearchOriginalFilename deliberately does not filter by date. Immich's filename
 // search is a pattern search, so results are checked for exact equality locally.
 func (c *Client) SearchOriginalFilename(ctx context.Context, name string) ([]ReviewAsset, error) {
-	result := []ReviewAsset{}
-	seen := map[string]bool{}
-	seenPages := map[string]bool{}
-	page := 1
-	cursor := ""
-	for {
+	return c.searchReviewAssets(ctx, func(page int, cursor string) map[string]any {
 		query := map[string]any{"originalFileName": name, "size": 1000, "withExif": true, "withStacked": true}
 		if cursor != "" {
 			delete(query, "originalFileName")
@@ -45,10 +41,53 @@ func (c *Client) SearchOriginalFilename(ctx context.Context, name string) ([]Rev
 		} else {
 			query["page"] = page
 		}
-		payload, _ := json.Marshal(query)
+		return query
+	}, func(a ReviewAsset) bool {
+		return a.OriginalFileName == name
+	})
+}
+
+// SearchTakenRange returns capture-time alternatives, including both boundaries.
+// Keep filters on every page, including Immich 3.2+'s cursor-based pages.
+func (c *Client) SearchTakenRange(ctx context.Context, after, before time.Time, isVideo bool) ([]ReviewAsset, error) {
+	if after.IsZero() || before.IsZero() || after.After(before) {
+		return nil, fmt.Errorf("invalid capture date range")
+	}
+	kind := "IMAGE"
+	if isVideo {
+		kind = "VIDEO"
+	}
+	from, to := after.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano)
+	return c.searchReviewAssets(ctx, func(page int, cursor string) map[string]any {
+		query := map[string]any{"size": 1000, "withExif": true, "withStacked": true}
+		if cursor != "" {
+			query["cursor"] = cursor
+			query["filter"] = map[string]any{
+				"takenAt": map[string]string{"gte": from, "lte": to},
+				"type":    map[string]string{"eq": kind},
+			}
+		} else {
+			query["page"] = page
+			query["takenAfter"], query["takenBefore"], query["type"] = from, to, kind
+		}
+		return query
+	}, func(a ReviewAsset) bool {
+		taken := a.TakenAt()
+		return a.Type == kind && !taken.IsZero() && !taken.Before(after) && !taken.After(before)
+	})
+}
+
+func (c *Client) searchReviewAssets(ctx context.Context, queryForPage func(int, string) map[string]any, matches func(ReviewAsset) bool) ([]ReviewAsset, error) {
+	result := []ReviewAsset{}
+	seen := map[string]bool{}
+	seenPages := map[string]bool{}
+	page := 1
+	cursor := ""
+	for {
+		payload, _ := json.Marshal(queryForPage(page, cursor))
 		body, err := c.request(ctx, http.MethodPost, "search/metadata", payload, "")
 		if err != nil {
-			return nil, fmt.Errorf("Immich filename search failed: %w", err)
+			return nil, fmt.Errorf("Immich search failed: %w", err)
 		}
 		var response struct {
 			Assets *struct {
@@ -61,7 +100,7 @@ func (c *Client) SearchOriginalFilename(ctx context.Context, name string) ([]Rev
 			return nil, fmt.Errorf("unexpected Immich search response")
 		}
 		for _, a := range response.Assets.Items {
-			if a.ID != "" && a.OriginalFileName == name && !seen[a.ID] {
+			if a.ID != "" && matches(a) && !seen[a.ID] {
 				seen[a.ID] = true
 				result = append(result, a)
 			}
