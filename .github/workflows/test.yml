@@ -38,7 +38,7 @@ jobs:
           trap 'docker rm -f review-smoke >/dev/null 2>&1 || true' EXIT
           docker run --name review-smoke -d -p 127.0.0.1:18088:8080 gphotos2immich-review:ci
           curl --fail --retry 15 --retry-connrefused --retry-delay 1 http://127.0.0.1:18088/ > /tmp/review.html
-          grep -q 'Ricrea i tuoi album' /tmp/review.html
+          grep -q 'Recreate your albums' /tmp/review.html
           status=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18088/api/sync)
           test "$status" = 403
       - name: Log in to fork registry

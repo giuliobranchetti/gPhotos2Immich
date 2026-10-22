@@ -108,7 +108,7 @@ func TestReviewCancelAndSyncDisabled(t *testing.T) {
 		}
 	}
 	w := reviewRequest(t, s, "GET", "/", "")
-	if w.Code != 200 || !strings.Contains(w.Body.String(), "Ricrea i tuoi album") {
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "Recreate your albums") {
 		t.Fatal("review mode did not serve review UI")
 	}
 }

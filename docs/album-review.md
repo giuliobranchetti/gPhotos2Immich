@@ -19,7 +19,7 @@ disponibile soltanto avviando esplicitamente con `APP_MODE=sync`.
    per un Immich sul PC host usare `http://host.docker.internal:2283/api`.
 4. Incollare il link condiviso Google Photos e generare l'anteprima.
 5. Controllare titolo, candidati e date; selezionare le foto da includere.
-6. Premere **Crea album** oppure **Annulla**.
+6. Premere **Create album** oppure **Cancel**.
 
 Permessi della chiave: `asset.read`, `asset.view` (miniature), `album.read`,
 `album.create`, `albumAsset.create`. La ricerca vede solo le foto accessibili
@@ -78,14 +78,14 @@ docker compose --env-file dev/.env -f dev/compose.yml down
   oppure con il suo `fileCreatedAt` se l'EXIF non è disponibile. Il timestamp
   di caricamento `createdAt` non è usato.
 - Tolleranza di un secondo per la precisione dei metadati.
-- Se manca una data, il candidato rimane visibile come **Data da verificare**.
+- Se manca una data, il candidato rimane visibile come **Check date**.
 - Il primo candidato visualizzato è sempre preselezionato, anche con data
   diversa, data assente o più risultati. Le corrispondenze con la stessa data
   vengono mostrate per prime. Si può scegliere un altro candidato o escludere
   la foto prima della conferma. Le foto senza candidati rimangono escluse.
 - I nomi vengono letti con HEAD e Content-Disposition; nessun originale viene
   scaricato. Per i video si usa la variante `=dv`. Formati senza intestazione
-  utilizzabile restano indicati come **Nome non disponibile**.
+  utilizzabile restano indicati come **Filename unavailable**.
 - Una paginazione Google incompleta blocca l'anteprima anziché creare un album
   da un elenco parziale. Il protocollo Google è non ufficiale e può cambiare.
 

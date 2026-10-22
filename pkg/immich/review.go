@@ -151,16 +151,16 @@ type ThumbnailError struct {
 func (e *ThumbnailError) Error() string {
 	switch e.StatusCode {
 	case http.StatusUnauthorized:
-		return "Immich ha rifiutato la chiave API (HTTP 401). Verifica il collegamento a Immich."
+		return "Immich rejected the API key (HTTP 401). Check the Immich connection."
 	case http.StatusForbidden:
 		if e.MissingViewPermission {
-			return "La chiave API Immich non ha il permesso asset.view, necessario per le anteprime. Abilitalo nelle impostazioni della chiave e ricarica la pagina."
+			return "The Immich API key is missing the asset.view permission required for previews. Enable it in the API key settings and reload the page."
 		}
-		return "Immich non consente di visualizzare questa foto (HTTP 403). Verifica i permessi della chiave API e l'accesso alla foto."
+		return "Immich denied access to this photo (HTTP 403). Check the API key permissions and access to the photo."
 	case http.StatusNotFound:
-		return "Miniatura non disponibile su Immich (HTTP 404)."
+		return "Thumbnail unavailable in Immich (HTTP 404)."
 	default:
-		return fmt.Sprintf("Immich non ha restituito una miniatura valida (HTTP %d).", e.StatusCode)
+		return fmt.Sprintf("Immich did not return a valid thumbnail (HTTP %d).", e.StatusCode)
 	}
 }
 
