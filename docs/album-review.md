@@ -79,8 +79,10 @@ docker compose --env-file dev/.env -f dev/compose.yml down
   di caricamento `createdAt` non è usato.
 - Tolleranza di un secondo per la precisione dei metadati.
 - Se manca una data, il candidato rimane visibile come **Data da verificare**.
-- Se ci sono più candidati, la scelta è manuale. Una corrispondenza univoca
-  con la stessa data è preselezionata; le altre richiedono selezione esplicita.
+- Il primo candidato visualizzato è sempre preselezionato, anche con data
+  diversa, data assente o più risultati. Le corrispondenze con la stessa data
+  vengono mostrate per prime. Si può scegliere un altro candidato o escludere
+  la foto prima della conferma. Le foto senza candidati rimangono escluse.
 - I nomi vengono letti con HEAD e Content-Disposition; nessun originale viene
   scaricato. Per i video si usa la variante `=dv`. Formati senza intestazione
   utilizzabile restano indicati come **Nome non disponibile**.
