@@ -3,6 +3,7 @@ package immich
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -89,6 +90,33 @@ func TestThumbnailDoesNotExposeKeyOrAcceptHTML(t *testing.T) {
 	}))
 	if _, _, err := c.ReviewThumbnail(context.Background(), "a"); err == nil {
 		t.Fatal("HTML accepted as image")
+	}
+}
+
+func TestThumbnailExplainsMissingViewPermission(t *testing.T) {
+	c := reviewTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `{"message":"Missing required permission: asset.view"}`)
+	}))
+	_, _, err := c.ReviewThumbnail(context.Background(), "a")
+	var failure *ThumbnailError
+	if !errors.As(err, &failure) || failure.StatusCode != 403 || !failure.MissingViewPermission || !strings.Contains(err.Error(), "asset.view") || strings.Contains(err.Error(), "test-key") {
+		t.Fatalf("unhelpful thumbnail error: %v", err)
+	}
+}
+
+func TestThumbnailDistinguishesOtherAccessErrors(t *testing.T) {
+	for _, status := range []int{401, 403, 404} {
+		c := reviewTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+			io.WriteString(w, `{"message":"other error"}`)
+		}))
+		_, _, err := c.ReviewThumbnail(context.Background(), "a")
+		var failure *ThumbnailError
+		if !errors.As(err, &failure) || failure.StatusCode != status || failure.MissingViewPermission {
+			t.Fatalf("wrong status: %v", err)
+		}
 	}
 }
 func TestSearchRejectsUnexpectedResponse(t *testing.T) {

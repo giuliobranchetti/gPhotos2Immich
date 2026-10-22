@@ -43,6 +43,9 @@ func TestReviewFullHTTPFlowWithoutUploads(t *testing.T) {
 		case "PUT /api/albums/new-album/assets":
 			adds++
 			io.WriteString(w, `[{"id":"asset-1","success":true}]`)
+		case "GET /api/assets/asset-1/thumbnail":
+			w.WriteHeader(http.StatusForbidden)
+			io.WriteString(w, `{"message":"Missing required permission: asset.view"}`)
 		default:
 			t.Errorf("unexpected operation %s %s", r.Method, r.URL.Path)
 			http.Error(w, "unexpected", 400)
@@ -86,6 +89,10 @@ func TestReviewFullHTTPFlowWithoutUploads(t *testing.T) {
 	denied := reviewRequest(t, s, "GET", "/api/review/thumbnail?session="+session.ID+"&asset=foreign", "")
 	if denied.Code != 404 {
 		t.Fatal("foreign thumbnail accepted")
+	}
+	forbidden := reviewRequest(t, s, "GET", "/api/review/thumbnail?session="+session.ID+"&asset=asset-1", "")
+	if forbidden.Code != 403 || !strings.Contains(forbidden.Body.String(), "asset.view") {
+		t.Fatalf("permission error was hidden: %d %s", forbidden.Code, forbidden.Body)
 	}
 	cfg := reviewRequest(t, s, "GET", "/api/review/config", "")
 	if strings.Contains(cfg.Body.String(), "private-test-key") {

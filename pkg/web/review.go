@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -192,7 +193,12 @@ func (s *Server) handleReview(w http.ResponseWriter, r *http.Request) {
 		}
 		data, ct, err := client.ReviewThumbnail(ctx, id)
 		if err != nil {
-			reviewError(w, 502, err)
+			status := http.StatusBadGateway
+			var thumbnailError *immich.ThumbnailError
+			if errors.As(err, &thumbnailError) && thumbnailError.StatusCode >= 400 && thumbnailError.StatusCode <= 599 {
+				status = thumbnailError.StatusCode
+			}
+			reviewError(w, status, err)
 			return
 		}
 		w.Header().Set("Cache-Control", "private, max-age=120")

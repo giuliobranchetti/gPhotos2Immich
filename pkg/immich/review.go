@@ -143,6 +143,27 @@ func (c *Client) AddReviewAssets(ctx context.Context, albumID string, ids []stri
 	return failed, nil
 }
 
+type ThumbnailError struct {
+	StatusCode            int
+	MissingViewPermission bool
+}
+
+func (e *ThumbnailError) Error() string {
+	switch e.StatusCode {
+	case http.StatusUnauthorized:
+		return "Immich ha rifiutato la chiave API (HTTP 401). Verifica il collegamento a Immich."
+	case http.StatusForbidden:
+		if e.MissingViewPermission {
+			return "La chiave API Immich non ha il permesso asset.view, necessario per le anteprime. Abilitalo nelle impostazioni della chiave e ricarica la pagina."
+		}
+		return "Immich non consente di visualizzare questa foto (HTTP 403). Verifica i permessi della chiave API e l'accesso alla foto."
+	case http.StatusNotFound:
+		return "Miniatura non disponibile su Immich (HTTP 404)."
+	default:
+		return fmt.Sprintf("Immich non ha restituito una miniatura valida (HTTP %d).", e.StatusCode)
+	}
+}
+
 func (c *Client) ReviewThumbnail(ctx context.Context, id string) ([]byte, string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.APIURL+"/assets/"+url.PathEscape(id)+"/thumbnail?size=thumbnail", nil)
 	if err != nil {
@@ -155,8 +176,20 @@ func (c *Client) ReviewThumbnail(ctx context.Context, id string) ([]byte, string
 	}
 	defer resp.Body.Close()
 	ct := resp.Header.Get("Content-Type")
-	if resp.StatusCode != 200 || !(strings.HasPrefix(ct, "image/jpeg") || strings.HasPrefix(ct, "image/png") || strings.HasPrefix(ct, "image/webp") || strings.HasPrefix(ct, "image/avif")) {
-		return nil, "", fmt.Errorf("thumbnail unavailable")
+	if resp.StatusCode != http.StatusOK {
+		failure := &ThumbnailError{StatusCode: resp.StatusCode}
+		if resp.StatusCode == http.StatusForbidden {
+			var response struct {
+				Message string `json:"message"`
+			}
+			if json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&response) == nil && response.Message == "Missing required permission: asset.view" {
+				failure.MissingViewPermission = true
+			}
+		}
+		return nil, "", failure
+	}
+	if !(strings.HasPrefix(ct, "image/jpeg") || strings.HasPrefix(ct, "image/png") || strings.HasPrefix(ct, "image/webp") || strings.HasPrefix(ct, "image/avif")) {
+		return nil, "", &ThumbnailError{StatusCode: http.StatusBadGateway}
 	}
 	data, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024+1))
 	if len(data) > 10*1024*1024 {

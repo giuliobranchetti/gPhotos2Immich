@@ -26,6 +26,12 @@ Permessi della chiave: `asset.read`, `asset.view` (miniature), `album.read`,
 all'utente della chiave, comprese le restrizioni di condivisione di Immich.
 Non serve `asset.upload`.
 
+Se i risultati della ricerca compaiono ma le miniature Immich no, controllare
+il permesso `asset.view`: `asset.read` consente la ricerca ma non autorizza
+la visualizzazione delle immagini. La UI riporta il rifiuto HTTP 403 e il
+permesso mancante. Dopo averlo abilitato sulla chiave, salvare in Immich e
+ricaricare la pagina del plugin; non occorre ricreare l'anteprima.
+
 L'interfaccia non ha autenticazione propria: i compose pubblicano solo su
 127.0.0.1. Chi può aprire questa UI può usare la connessione configurata.
 Per il binario nativo l'ascolto predefinito è 127.0.0.1; `LISTEN_HOST` permette
