@@ -19,7 +19,13 @@ concurrency:
     cancel-in-progress: false
 
 jobs:
+    test:
+        permissions:
+            contents: read
+            packages: write
+        uses: ./.github/workflows/test.yml
     build-and-push:
+        needs: test
         runs-on: ubuntu-latest
         permissions:
             contents: read

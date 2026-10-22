@@ -17,6 +17,7 @@ FROM alpine:latest
 WORKDIR /app
 
 # Install ca-certificates and tzdata for timezones, plus su-exec for dropping privileges
+ENV APP_MODE=review LISTEN_HOST=0.0.0.0
 RUN apk --no-cache add ca-certificates tzdata su-exec \
     && addgroup -g 1000 app \
     && adduser -u 1000 -G app -D -H app \

@@ -27,19 +27,23 @@ var (
 )
 
 type Album struct {
-	ID     string
-	Title  string
-	Photos []Photo
+	ID            string
+	Title         string
+	Photos        []Photo
+	ExpectedCount *int
 }
 
 type Photo struct {
-	ID          string
-	URL         string
-	Width       int
-	Height      int
-	IsVideo     bool
-	TakenAt     time.Time
-	Description string
+	ID               string
+	URL              string
+	Width            int
+	Height           int
+	IsVideo          bool
+	TakenAt          time.Time
+	Description      string
+	OriginalFileName string
+	FilenameError    string
+	UTCOffsetSeconds *int
 }
 
 // ScrapeAlbum parses a Google Photos shared album URL and returns the Album structure.
@@ -152,6 +156,24 @@ func ScrapeAlbum(ctx context.Context, client *Client, albumURL string) (*Album, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse album JSON: %v", err)
 	}
+	var expectedCount *int
+	if len(data) > 3 {
+		if meta, ok := data[3].([]interface{}); ok {
+			if len(meta) > 1 {
+				if exactTitle, ok := meta[1].(string); ok && strings.TrimSpace(exactTitle) != "" {
+					title = exactTitle
+				}
+			}
+			// Observed album item-count field. A changed shape fails closed rather
+			// than presenting a silently truncated preview.
+			if len(meta) > 21 {
+				if count, ok := extractInt(meta[21]); ok && count >= 0 {
+					value := int(count)
+					expectedCount = &value
+				}
+			}
+		}
+	}
 
 	// Structure: [metadata, [item1, item2, ...], token, ...]
 	// Index 1 is usually the item list.
@@ -170,6 +192,9 @@ func ScrapeAlbum(ctx context.Context, client *Client, albumURL string) (*Album, 
 
 	// Parse initial batch of items from embedded page data
 	photos := parsePhotoItems(list)
+	if client.requireComplete && (list == nil || len(photos) != len(list)) {
+		return nil, fmt.Errorf("album data is incomplete or has an unsupported format")
+	}
 
 	// Extract pagination tokens for fetching remaining album items
 	wiz := extractWizTokens(htmlContent)
@@ -218,31 +243,52 @@ func ScrapeAlbum(ctx context.Context, client *Client, albumURL string) (*Album, 
 		if mediaKey != "" {
 			client.logger.Info("Album has continuation token, fetching remaining items", "count", len(photos))
 			const maxPages = 500
+			seenTokens := make(map[string]bool)
 			for page := 0; page < maxPages && continueToken != ""; page++ {
+				if seenTokens[continueToken] && client.requireComplete {
+					return nil, fmt.Errorf("album pagination repeated a token; preview is incomplete")
+				}
+				seenTokens[continueToken] = true
 				client.logger.Debug("Fetching album page", "page", page+2, "total_items", len(photos))
 				nextPhotos, nextToken, fetchErr := fetchNextPage(ctx, client, mediaKey, authKey, continueToken, sourcePath, wiz)
 				if fetchErr != nil {
+					if client.requireComplete {
+						return nil, fmt.Errorf("album pagination failed: %w", fetchErr)
+					}
 					client.logger.Warn("Pagination stopped", "page", page+2, "error", fetchErr)
 					break
 				}
 				if len(nextPhotos) == 0 {
+					if client.requireComplete {
+						return nil, fmt.Errorf("album pagination returned an unexpected empty page")
+					}
 					break
 				}
 				photos = append(photos, nextPhotos...)
 				continueToken = nextToken
 			}
+			if continueToken != "" && client.requireComplete {
+				return nil, fmt.Errorf("album pagination did not complete")
+			}
 		} else {
+			if client.requireComplete {
+				return nil, fmt.Errorf("album pagination key is missing")
+			}
 			client.logger.Warn("Could not determine album mediaKey, pagination skipped")
 		}
 	}
 
 	// Remove duplicate photos from overlapping pages
 	photos = deduplicatePhotos(photos)
+	if client.requireComplete && expectedCount != nil && len(photos) != *expectedCount {
+		return nil, fmt.Errorf("album count mismatch: expected %d items, read %d", *expectedCount, len(photos))
+	}
 
 	return &Album{
-		ID:     finalURL,
-		Title:  title,
-		Photos: photos,
+		ID:            finalURL,
+		Title:         title,
+		Photos:        photos,
+		ExpectedCount: expectedCount,
 	}, nil
 }
 
@@ -299,6 +345,13 @@ func parsePhotoItems(list []interface{}) []Photo {
 		}
 
 		timestamp := extractTimestamp(itemArr)
+		var offset *int
+		if len(itemArr) > 4 {
+			if ms, ok := extractInt(itemArr[4]); ok && ms >= -14*3600000 && ms <= 14*3600000 {
+				seconds := int(ms / 1000)
+				offset = &seconds
+			}
+		}
 
 		var description string
 		for i := 3; i < len(itemArr); i++ {
@@ -310,13 +363,14 @@ func parsePhotoItems(list []interface{}) []Photo {
 
 		if photoURL != "" {
 			photos = append(photos, Photo{
-				ID:          id,
-				URL:         photoURL,
-				Width:       w,
-				Height:      h,
-				IsVideo:     itemIsVideo(itemArr),
-				TakenAt:     timestamp,
-				Description: description,
+				ID:               id,
+				URL:              photoURL,
+				Width:            w,
+				Height:           h,
+				IsVideo:          itemIsVideo(itemArr),
+				TakenAt:          timestamp,
+				Description:      description,
+				UTCOffsetSeconds: offset,
 			})
 		}
 	}
@@ -516,6 +570,9 @@ func parseBatchResponse(body string) ([]Photo, string, error) {
 		if len(payload) > 1 {
 			if items, ok := payload[1].([]interface{}); ok {
 				photos = parsePhotoItems(items)
+				if len(photos) != len(items) {
+					return nil, "", fmt.Errorf("unsupported items in album page")
+				}
 			}
 		}
 
@@ -548,40 +605,14 @@ func deduplicatePhotos(photos []Photo) []Photo {
 
 // extractTimestamp extracts the best available timestamp from a scraped item
 func extractTimestamp(itemArr []interface{}) time.Time {
-	now := time.Now()
-	var candidates []int64
-
-	// Collect all plausible timestamps from the item
-	for i := 2; i < len(itemArr); i++ {
-		if metaArr, ok := itemArr[i].([]interface{}); ok && len(metaArr) > 0 {
-			if t, ok := extractInt(metaArr[0]); ok {
-				t = normalizeTimestamp(t)
-				if t > 946684800000 && time.UnixMilli(t).Before(now.Add(24*time.Hour)) {
-					candidates = append(candidates, t)
-				}
-			}
-		}
-		if t, ok := extractInt(itemArr[i]); ok {
-			t = normalizeTimestamp(t)
-			if t > 946684800000 && time.UnixMilli(t).Before(now.Add(24*time.Hour)) {
-				candidates = append(candidates, t)
-			}
+	// The album's taken-time field is authoritative, including dates before 2000.
+	// Never substitute an upload timestamp when this known field is missing.
+	if len(itemArr) > 2 {
+		if t, ok := extractInt(itemArr[2]); ok {
+			return time.UnixMilli(normalizeTimestamp(t)).UTC()
 		}
 	}
-
-	if len(candidates) == 0 {
-		return time.Time{}
-	}
-
-	// Prefer the oldest valid timestamp (most likely the "taken" date)
-	best := candidates[0]
-	for _, c := range candidates[1:] {
-		if c < best {
-			best = c
-		}
-	}
-
-	return time.UnixMilli(best)
+	return time.Time{}
 }
 
 // hasMotionPhotoXMP checks if data contains any motion photo XMP markers

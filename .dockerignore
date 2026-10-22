@@ -1,0 +1,10 @@
+.git
+.github
+.env
+config.json
+dev/config.json
+dev/.env
+dev/data
+data
+*.exe
+*.log

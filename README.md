@@ -1,4 +1,12 @@
 # gPhotos2Immich
+
+> **Fork: manual album review.** The default startup mode reconstructs albums
+> from existing Immich assets after a visual confirmation. It does not start
+> the automatic upload/sync described in the upstream documentation below.
+> See [setup, isolated testing and recovery](docs/album-review.md).
+> Use `docker compose -f compose.review.yml up -d --build` for the review UI.
+> Legacy automatic synchronization requires explicitly setting `APP_MODE=sync`.
+
 ![Docker Downloads](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fipitio.github.io%2Fbackage%2Fwarreth%2FgPhotos2Immich%2Fgphotos2immich.json&query=%24.downloads&label=Total%20Downloads&color=blue)
 ![Docker Daily Downloads](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fipitio.github.io%2Fbackage%2Fwarreth%2FgPhotos2Immich%2Fgphotos2immich.json&query=%24.downloads_day&label=Daily%20Downloads&color=teal)
 

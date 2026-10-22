@@ -1,0 +1,297 @@
+// Package review reconstructs albums using existing assets only. Its interfaces
+// deliberately expose no upload, delete or asset-metadata mutation operations.
+package review
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"warreth.dev/gphotos2immich/pkg/googlephotos"
+	"warreth.dev/gphotos2immich/pkg/immich"
+)
+
+type Library interface {
+	SearchOriginalFilename(context.Context, string) ([]immich.ReviewAsset, error)
+	GetAlbums(context.Context) ([]immich.Album, error)
+	CreateReviewAlbum(context.Context, string) (string, error)
+	AddReviewAssets(context.Context, string, []string) ([]string, error)
+}
+
+type Candidate struct {
+	ID         string     `json:"id"`
+	Filename   string     `json:"filename"`
+	TakenAt    *time.Time `json:"takenAt"`
+	DateStatus string     `json:"dateStatus"`
+}
+type Item struct {
+	ID               string      `json:"id"`
+	Filename         string      `json:"filename"`
+	TakenAt          *time.Time  `json:"takenAt"`
+	UTCOffsetSeconds *int        `json:"utcOffsetSeconds"`
+	Thumbnail        string      `json:"thumbnail"`
+	IsVideo          bool        `json:"isVideo"`
+	Status           string      `json:"status"`
+	Warning          string      `json:"warning,omitempty"`
+	Candidates       []Candidate `json:"candidates"`
+}
+type Session struct {
+	ID        string            `json:"id"`
+	Title     string            `json:"title"`
+	CreatedAt time.Time         `json:"createdAt"`
+	Target    string            `json:"target"`
+	Status    string            `json:"status"`
+	Items     []Item            `json:"items"`
+	AlbumID   string            `json:"albumId,omitempty"`
+	Selected  map[string]string `json:"selected,omitempty"`
+	FailedIDs []string          `json:"failedIds,omitempty"`
+	Message   string            `json:"message,omitempty"`
+}
+type Service struct {
+	Dir string
+	mu  sync.Mutex
+}
+
+func New(dir string) *Service { return &Service{Dir: dir} }
+func instant(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	t = t.UTC()
+	return &t
+}
+func dateStatus(source, candidate time.Time) string {
+	if source.IsZero() || candidate.IsZero() {
+		return "unknown_date"
+	}
+	delta := source.Sub(candidate)
+	if delta < 0 {
+		delta = -delta
+	}
+	if delta <= time.Second {
+		return "matched"
+	}
+	return "date_mismatch"
+}
+
+func (s *Service) Preview(ctx context.Context, album *googlephotos.Album, client Library, target string) (*Session, error) {
+	id := make([]byte, 24)
+	if _, err := rand.Read(id); err != nil {
+		return nil, err
+	}
+	session := &Session{ID: hex.EncodeToString(id), Title: album.Title, CreatedAt: time.Now().UTC(), Target: target, Status: "ready", Items: []Item{}}
+	cache := map[string][]immich.ReviewAsset{}
+	seen := map[string]bool{}
+	for _, photo := range album.Photos {
+		if photo.ID == "" || seen[photo.ID] {
+			return nil, fmt.Errorf("album contains missing or duplicate identifiers")
+		}
+		seen[photo.ID] = true
+		item := Item{ID: photo.ID, Filename: photo.OriginalFileName, TakenAt: instant(photo.TakenAt), UTCOffsetSeconds: photo.UTCOffsetSeconds, IsVideo: photo.IsVideo, Status: "missing", Candidates: []Candidate{}}
+		item.Thumbnail = googlephotos.PreviewURL(photo.URL)
+		if photo.OriginalFileName == "" {
+			item.Status = "filename_unavailable"
+			item.Warning = photo.FilenameError
+			session.Items = append(session.Items, item)
+			continue
+		}
+		assets, cached := cache[photo.OriginalFileName]
+		if !cached {
+			var err error
+			assets, err = client.SearchOriginalFilename(ctx, photo.OriginalFileName)
+			if err != nil {
+				return nil, err
+			}
+			cache[photo.OriginalFileName] = assets
+		}
+		for _, asset := range assets {
+			if asset.OriginalFileName != photo.OriginalFileName || asset.ID == "" {
+				continue
+			}
+			item.Candidates = append(item.Candidates, Candidate{ID: asset.ID, Filename: asset.OriginalFileName, TakenAt: instant(asset.TakenAt()), DateStatus: dateStatus(photo.TakenAt, asset.TakenAt())})
+		}
+		sort.SliceStable(item.Candidates, func(i, j int) bool {
+			return item.Candidates[i].DateStatus == "matched" && item.Candidates[j].DateStatus != "matched"
+		})
+		if len(item.Candidates) == 1 {
+			item.Status = item.Candidates[0].DateStatus
+		} else if len(item.Candidates) > 1 {
+			item.Status = "ambiguous"
+		}
+		session.Items = append(session.Items, item)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.save(session); err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+func validID(id string) bool { b, err := hex.DecodeString(id); return err == nil && len(b) == 24 }
+func (s *Service) save(session *Session) error {
+	if err := os.MkdirAll(s.Dir, 0700); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(session, "", "  ")
+	if err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(s.Dir, ".review-*")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	if err = f.Chmod(0600); err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	return os.Rename(tmp, filepath.Join(s.Dir, session.ID+".json"))
+}
+func (s *Service) load(id, target string) (*Session, error) {
+	if !validID(id) {
+		return nil, fmt.Errorf("invalid preview identifier")
+	}
+	data, err := os.ReadFile(filepath.Join(s.Dir, id+".json"))
+	if err != nil {
+		return nil, fmt.Errorf("preview not found")
+	}
+	var session Session
+	if err := json.Unmarshal(data, &session); err != nil {
+		return nil, err
+	}
+	if session.Target != target {
+		return nil, fmt.Errorf("Immich connection changed; generate a new preview")
+	}
+	return &session, nil
+}
+func (s *Service) Get(id, target string) (*Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.load(id, target)
+}
+func (s *Service) Cancel(id, target string) (*Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, err := s.load(id, target)
+	if err != nil {
+		return nil, err
+	}
+	if session.Status != "ready" && session.Status != "cancelled" {
+		return session, fmt.Errorf("creation has already started; this preview cannot be cancelled")
+	}
+	session.Status = "cancelled"
+	return session, s.save(session)
+}
+func (s *Service) Confirm(ctx context.Context, id, target, title string, selected map[string]string, client Library) (*Session, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	session, err := s.load(id, target)
+	if err != nil {
+		return nil, err
+	}
+	title = strings.TrimSpace(title)
+	if title == "" || len(title) > 500 {
+		return session, fmt.Errorf("enter an album title of at most 500 bytes")
+	}
+	if session.Status == "cancelled" {
+		return session, fmt.Errorf("preview was cancelled")
+	}
+	if session.Status == "creating" || session.Status == "creation_unknown" {
+		return session, fmt.Errorf("creation outcome is uncertain; check Immich before creating another album")
+	}
+	if session.Status != "ready" && (title != session.Title || !reflect.DeepEqual(selected, session.Selected)) {
+		return session, fmt.Errorf("a started creation cannot change title or selection")
+	}
+	if session.Status == "complete" {
+		return session, nil
+	}
+	if session.Status == "ready" && time.Since(session.CreatedAt) > 24*time.Hour {
+		return session, fmt.Errorf("preview expired; generate it again")
+	}
+	allowed := map[string]map[string]bool{}
+	for _, item := range session.Items {
+		allowed[item.ID] = map[string]bool{}
+		for _, c := range item.Candidates {
+			allowed[item.ID][c.ID] = true
+		}
+	}
+	ids := []string{}
+	seen := map[string]bool{}
+	for itemID, assetID := range selected {
+		if !allowed[itemID][assetID] {
+			return session, fmt.Errorf("selection contains a photo outside this preview")
+		}
+		if !seen[assetID] {
+			seen[assetID] = true
+			ids = append(ids, assetID)
+		}
+	}
+	if len(ids) == 0 {
+		return session, fmt.Errorf("select at least one photo")
+	}
+	sort.Strings(ids)
+	if session.Status == "ready" {
+		albums, err := client.GetAlbums(ctx)
+		if err != nil {
+			return session, err
+		}
+		for _, album := range albums {
+			if album.AlbumName == title {
+				return session, fmt.Errorf("an album with this title already exists; choose a different title")
+			}
+		}
+		session.Title = title
+		session.Selected = selected
+		session.Status = "creating"
+		if err := s.save(session); err != nil {
+			return session, err
+		}
+		albumID, err := client.CreateReviewAlbum(ctx, title)
+		if err != nil {
+			session.Status = "creation_unknown"
+			session.Message = "Check Immich: the server may have created the album. No automatic retry."
+			_ = s.save(session)
+			return session, fmt.Errorf("album creation outcome is uncertain; check Immich")
+		}
+		session.AlbumID = albumID
+		session.Status = "adding"
+		if err := s.save(session); err != nil {
+			return session, fmt.Errorf("album %s created, but journal could not be saved: %w", albumID, err)
+		}
+	}
+	if session.AlbumID == "" {
+		return session, fmt.Errorf("missing album ID; manual verification required")
+	}
+	failed, addErr := client.AddReviewAssets(ctx, session.AlbumID, ids)
+	session.FailedIDs = failed
+	if addErr != nil {
+		session.Status = "partial"
+		session.Message = "Album created. Retry to add the selected photos to the same album."
+	} else {
+		session.Status = "complete"
+		session.Message = "Album created with the selected existing photos."
+	}
+	if err := s.save(session); err != nil {
+		return session, err
+	}
+	return session, addErr
+}

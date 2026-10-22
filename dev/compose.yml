@@ -1,0 +1,65 @@
+# Isolated test deployment, based on Immich's v3.3.5 release compose.
+# Database, uploads and review journal are independent Docker volumes.
+name: gphotos2immich-test
+services:
+  review:
+    build: ..
+    image: gphotos2immich-review:dev
+    ports:
+      - "127.0.0.1:8088:8080"
+    environment:
+      APP_MODE: review
+      LISTEN_HOST: 0.0.0.0
+    volumes:
+      - ./config.json:/app/config.json
+      - review-data:/app/data
+    depends_on:
+      - immich-server
+    restart: unless-stopped
+  immich-server:
+    image: ghcr.io/immich-app/immich-server:v3.3.5
+    ports:
+      - "127.0.0.1:2285:2283"
+    environment:
+      DB_HOSTNAME: database
+      DB_USERNAME: postgres
+      DB_PASSWORD: ${TEST_DB_PASSWORD:?Set TEST_DB_PASSWORD in dev/.env}
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: redis
+      TZ: Europe/Rome
+    volumes:
+      - test-uploads:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      database:
+        condition: service_healthy
+    restart: unless-stopped
+  redis:
+    image: docker.io/valkey/valkey:9@sha256:c123e3715db63d06d4ad6964884037aa0d5d4d703939b9929954112889708e1d
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+  database:
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    environment:
+      POSTGRES_PASSWORD: ${TEST_DB_PASSWORD:?Set TEST_DB_PASSWORD in dev/.env}
+      POSTGRES_USER: postgres
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: --data-checksums
+    volumes:
+      - test-database:/var/lib/postgresql/data
+    shm_size: 128mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d immich"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+volumes:
+  review-data:
+  test-uploads:
+  test-database:

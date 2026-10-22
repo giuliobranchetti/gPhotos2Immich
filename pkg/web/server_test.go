@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -46,17 +47,15 @@ func TestSaveConfig(t *testing.T) {
 }
 
 func TestSaveConfigPermissionError(t *testing.T) {
-	// Create read-only directory
+	// A directory cannot be overwritten as a config file on Windows or Unix,
+	// including CI runners with elevated privileges.
 	tmpDir := t.TempDir()
 	roDir := filepath.Join(tmpDir, "ro")
-	if err := os.Mkdir(roDir, 0555); err != nil {
+	if err := os.Mkdir(roDir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		os.Chmod(roDir, 0755)
-	})
 
-	configPath := filepath.Join(roDir, "config.json")
+	configPath := roDir
 	s := NewServer(configPath)
 
 	body := []byte(`{
@@ -82,9 +81,9 @@ func TestSaveConfigPermissionError(t *testing.T) {
 
 func TestHandleSync(t *testing.T) {
 	s := NewServer("dummy.json")
-	var triggered bool
+	var triggered atomic.Bool
 	s.OnSyncTrigger = func() {
-		triggered = true
+		triggered.Store(true)
 	}
 
 	// Test POST
@@ -99,17 +98,17 @@ func TestHandleSync(t *testing.T) {
 
 	// Wait briefly for goroutine
 	for i := 0; i < 50; i++ {
-		if triggered {
+		if triggered.Load() {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !triggered {
+	if !triggered.Load() {
 		t.Fatal("expected OnSyncTrigger to be called")
 	}
 
 	// Test GET (for easy browser/Home Assistant webhook usage)
-	triggered = false
+	triggered.Store(false)
 	reqGet := httptest.NewRequest(http.MethodGet, "/sync_now", nil)
 	wGet := httptest.NewRecorder()
 	s.handleSync(wGet, reqGet)
@@ -120,12 +119,12 @@ func TestHandleSync(t *testing.T) {
 	}
 
 	for i := 0; i < 50; i++ {
-		if triggered {
+		if triggered.Load() {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	if !triggered {
+	if !triggered.Load() {
 		t.Fatal("expected OnSyncTrigger to be called on GET")
 	}
 
@@ -140,21 +139,19 @@ func TestHandleSync(t *testing.T) {
 }
 func TestHandleStatus(t *testing.T) {
 	s := NewServer("dummy.json")
-	
+
 	req := httptest.NewRequest(http.MethodGet, "/sync/status", nil)
 	w := httptest.NewRecorder()
-	
+
 	s.handleStatus(w, req)
-	
+
 	resp := w.Result()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 OK on /sync/status, got %d", resp.StatusCode)
 	}
-	
+
 	bodyStr := w.Body.String()
 	if !strings.Contains(bodyStr, "immichUser") || !strings.Contains(bodyStr, "lastRun") || !strings.Contains(bodyStr, "nextRun") {
 		t.Fatalf("response missing expected fields: %s", bodyStr)
 	}
 }
-
-

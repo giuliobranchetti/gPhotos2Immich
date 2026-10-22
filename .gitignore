@@ -3,3 +3,9 @@ json
 main
 data
 data/sync-state.json
+.env
+dev/.env
+dev/config.json
+dev/data/
+*.exe
+*.log
