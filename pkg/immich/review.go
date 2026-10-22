@@ -1,0 +1,166 @@
+package immich
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"time"
+)
+
+type ReviewAsset struct {
+	ID               string    `json:"id"`
+	OriginalFileName string    `json:"originalFileName"`
+	FileCreatedAt    time.Time `json:"fileCreatedAt"`
+	ExifInfo         *struct {
+		DateTimeOriginal *time.Time `json:"dateTimeOriginal"`
+	} `json:"exifInfo"`
+}
+
+func (a ReviewAsset) TakenAt() time.Time {
+	if a.ExifInfo != nil && a.ExifInfo.DateTimeOriginal != nil {
+		return *a.ExifInfo.DateTimeOriginal
+	}
+	// Immich's fileCreatedAt is the capture/file timestamp, not uploaded-at createdAt.
+	return a.FileCreatedAt
+}
+
+// SearchOriginalFilename deliberately does not filter by date. Immich's filename
+// search is a pattern search, so results are checked for exact equality locally.
+func (c *Client) SearchOriginalFilename(ctx context.Context, name string) ([]ReviewAsset, error) {
+	result := []ReviewAsset{}
+	seen := map[string]bool{}
+	seenPages := map[string]bool{}
+	page := 1
+	cursor := ""
+	for {
+		query := map[string]any{"originalFileName": name, "size": 1000, "withExif": true, "withStacked": true}
+		if cursor != "" {
+			delete(query, "originalFileName")
+			query["filter"] = map[string]any{"originalFileName": map[string]string{"eq": name}}
+			query["cursor"] = cursor
+		} else {
+			query["page"] = page
+		}
+		payload, _ := json.Marshal(query)
+		body, err := c.request(ctx, http.MethodPost, "search/metadata", payload, "")
+		if err != nil {
+			return nil, fmt.Errorf("Immich filename search failed: %w", err)
+		}
+		var response struct {
+			Assets *struct {
+				Items      []ReviewAsset   `json:"items"`
+				NextPage   json.RawMessage `json:"nextPage"`
+				NextCursor string          `json:"nextCursor"`
+			} `json:"assets"`
+		}
+		if err := json.Unmarshal(body, &response); err != nil || response.Assets == nil {
+			return nil, fmt.Errorf("unexpected Immich search response")
+		}
+		for _, a := range response.Assets.Items {
+			if a.ID != "" && a.OriginalFileName == name && !seen[a.ID] {
+				seen[a.ID] = true
+				result = append(result, a)
+			}
+		}
+		next := strings.Trim(string(response.Assets.NextPage), "\"")
+		if response.Assets.NextCursor != "" {
+			next = response.Assets.NextCursor
+			if seenPages[next] || len(response.Assets.Items) == 0 || len(seenPages) >= 10000 {
+				return nil, fmt.Errorf("Immich cursor pagination did not complete")
+			}
+			seenPages[next] = true
+			cursor = next
+			continue
+		}
+		if next == "" || next == "null" {
+			break
+		}
+		if seenPages[next] || len(response.Assets.Items) == 0 || page >= 10000 {
+			return nil, fmt.Errorf("Immich search pagination did not complete")
+		}
+		seenPages[next] = true
+		var nextPage int
+		if _, err := fmt.Sscanf(next, "%d", &nextPage); err != nil || nextPage <= page {
+			return nil, fmt.Errorf("unsupported Immich search pagination")
+		}
+		page = nextPage
+	}
+	return result, nil
+}
+
+// CreateReviewAlbum must NEVER retry POST: a lost response may hide a created album.
+func (c *Client) CreateReviewAlbum(ctx context.Context, name string) (string, error) {
+	payload, _ := json.Marshal(map[string]string{"albumName": name})
+	body, _, err := c.doHTTP(ctx, http.MethodPost, "albums", strings.NewReader(string(payload)), "")
+	if err != nil {
+		return "", err
+	}
+	var album Album
+	if err := json.Unmarshal(body, &album); err != nil || album.Id == "" {
+		return "", fmt.Errorf("album creation returned no valid ID")
+	}
+	return album.Id, nil
+}
+
+// AddReviewAssets checks each result; HTTP 200 alone is not success.
+func (c *Client) AddReviewAssets(ctx context.Context, albumID string, ids []string) ([]string, error) {
+	failed := []string{}
+	for start := 0; start < len(ids); start += 100 {
+		end := min(start+100, len(ids))
+		chunk := ids[start:end]
+		payload, _ := json.Marshal(map[string]any{"ids": chunk})
+		body, err := c.request(ctx, http.MethodPut, "albums/"+url.PathEscape(albumID)+"/assets", payload, "")
+		if err != nil {
+			return append(failed, ids[start:]...), fmt.Errorf("adding photos failed: %w", err)
+		}
+		var results []struct {
+			ID      string `json:"id"`
+			Success bool   `json:"success"`
+			Error   string `json:"error"`
+		}
+		if err := json.Unmarshal(body, &results); err != nil {
+			return append(failed, ids[start:]...), fmt.Errorf("invalid add-assets response")
+		}
+		ok := map[string]bool{}
+		for _, r := range results {
+			if r.Success || strings.EqualFold(r.Error, "duplicate") {
+				ok[r.ID] = true
+			}
+		}
+		for _, id := range chunk {
+			if !ok[id] {
+				failed = append(failed, id)
+			}
+		}
+	}
+	if len(failed) > 0 {
+		return failed, fmt.Errorf("%d selected photos were not added", len(failed))
+	}
+	return failed, nil
+}
+
+func (c *Client) ReviewThumbnail(ctx context.Context, id string) ([]byte, string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.APIURL+"/assets/"+url.PathEscape(id)+"/thumbnail?size=thumbnail", nil)
+	if err != nil {
+		return nil, "", err
+	}
+	req.Header.Set("x-api-key", c.APIKey)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	defer resp.Body.Close()
+	ct := resp.Header.Get("Content-Type")
+	if resp.StatusCode != 200 || !(strings.HasPrefix(ct, "image/jpeg") || strings.HasPrefix(ct, "image/png") || strings.HasPrefix(ct, "image/webp") || strings.HasPrefix(ct, "image/avif")) {
+		return nil, "", fmt.Errorf("thumbnail unavailable")
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 10*1024*1024+1))
+	if len(data) > 10*1024*1024 {
+		return nil, "", fmt.Errorf("thumbnail too large")
+	}
+	return data, ct, err
+}

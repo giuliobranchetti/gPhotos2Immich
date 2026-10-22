@@ -16,12 +16,31 @@ import (
 )
 
 func main() {
+	// The fork defaults to manual album reconstruction. Configured legacy albums
+	// must never start uploading merely because the review UI was opened.
+	mode := os.Getenv("APP_MODE")
+	if mode == "" || mode == "review" {
+		port := 8080
+		if value := os.Getenv("PORT"); value != "" {
+			parsed, err := strconv.Atoi(value)
+			if err != nil || parsed < 1 || parsed > 65535 {
+				log.Fatal("Invalid PORT")
+			}
+			port = parsed
+		}
+		server := web.NewServer("config.json")
+		server.ReviewOnly = true
+		log.Fatal(server.Start(port))
+	}
+	if mode != "sync" {
+		log.Fatal("APP_MODE must be review or sync")
+	}
 	// Redirect stdout and stderr to our log buffer
 	r, w, _ := os.Pipe()
 	os.Stdout = w
 	os.Stderr = w
 	log.SetOutput(w)
-	
+
 	go func() {
 		buf := make([]byte, 1024)
 		for {

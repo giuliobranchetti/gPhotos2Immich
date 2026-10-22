@@ -1,0 +1,6 @@
+{
+  "apiURL": "http://immich-server:2283/api",
+  "apiKey": "",
+  "dataDir": "/app/data",
+  "googlePhotos": []
+}

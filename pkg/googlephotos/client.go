@@ -21,8 +21,9 @@ const (
 )
 
 type Client struct {
-	client *http.Client
-	logger *slog.Logger
+	client          *http.Client
+	logger          *slog.Logger
+	requireComplete bool
 }
 
 // NewClient creates a Google Photos HTTP client with connection pooling tuned to the given concurrency level

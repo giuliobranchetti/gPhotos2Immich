@@ -1,0 +1,16 @@
+name: gphotos2immich-review
+services:
+  review:
+    build: .
+    image: gphotos2immich-review:dev
+    ports:
+      - "127.0.0.1:8088:8080"
+    environment:
+      APP_MODE: review
+      LISTEN_HOST: 0.0.0.0
+    volumes:
+      - ./config.json:/app/config.json
+      - review-data:/app/data
+    restart: unless-stopped
+volumes:
+  review-data:

@@ -13,8 +13,10 @@ import (
 	"time"
 
 	"warreth.dev/gphotos2immich/pkg/config"
+	"warreth.dev/gphotos2immich/pkg/googlephotos"
 	"warreth.dev/gphotos2immich/pkg/immich"
 	"warreth.dev/gphotos2immich/pkg/progress"
+	"warreth.dev/gphotos2immich/pkg/review"
 )
 
 const maxLogSize = 100 * 1024 // 100KB max logs stored
@@ -31,7 +33,7 @@ func (l *LogBuffer) Write(p []byte) (n int, err error) {
 	defer l.mu.Unlock()
 	// write to original os.Stdout
 	originalStdout.Write(p)
-	
+
 	l.buf.Write(p)
 	if l.buf.Len() > maxLogSize {
 		// simple truncation: drop first half
@@ -53,18 +55,28 @@ var GlobalLogBuffer = &LogBuffer{}
 //go:embed index.html
 var indexHTML []byte
 
+//go:embed review.html
+var reviewHTML []byte
+
 type Server struct {
 	configPath     string
 	mu             sync.Mutex
 	OnConfigChange func()
 	OnSyncTrigger  func()
+	ReviewOnly     bool
+	reviews        *review.Service
+	readAlbum      func(context.Context, string) (*googlephotos.Album, error)
 }
 
 func NewServer(configPath string) *Server {
-	return &Server{configPath: configPath}
+	dir := "./data"
+	if cfg, err := config.ReadConfig(configPath); err == nil && cfg.DataDir != "" {
+		dir = cfg.DataDir
+	}
+	return &Server{configPath: configPath, reviews: review.New(dir + "/reviews")}
 }
 
-func (s *Server) Start(port int) error {
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api/config", s.handleConfig)
@@ -73,14 +85,27 @@ func (s *Server) Start(port int) error {
 	mux.HandleFunc("/sync/status", s.handleStatus)
 	mux.HandleFunc("/api/sync", s.handleSync)
 	mux.HandleFunc("/sync_now", s.handleSync)
+	mux.HandleFunc("/api/review/", s.handleReview)
+	mux.HandleFunc("/recreate", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write(reviewHTML)
+	})
+	return mux
+}
 
-	addr := fmt.Sprintf(":%d", port)
+func (s *Server) Start(port int) error {
+	host := os.Getenv("LISTEN_HOST")
+	if host == "" {
+		host = "127.0.0.1"
+	}
+	addr := fmt.Sprintf("%s:%d", host, port)
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:              addr,
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	fmt.Printf("Config Web UI running on http://localhost%s\n", addr)
+	fmt.Printf("Config Web UI running on http://%s\n", addr)
 	return srv.ListenAndServe()
 }
 
@@ -90,6 +115,10 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if s.ReviewOnly {
+		w.Write(reviewHTML)
+		return
+	}
 	w.Write(indexHTML)
 }
 
@@ -103,6 +132,10 @@ func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
+	if s.ReviewOnly {
+		http.Error(w, "Automatic synchronization is disabled in review mode", http.StatusForbidden)
+		return
+	}
 	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -182,6 +215,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if s.ReviewOnly {
+		http.Error(w, "Use the album review connection settings", http.StatusForbidden)
+		return
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
