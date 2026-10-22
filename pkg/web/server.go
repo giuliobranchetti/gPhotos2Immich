@@ -3,7 +3,7 @@ package web
 import (
 	"bytes"
 	"context"
-	_ "embed"
+	"embed"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -58,6 +58,9 @@ var indexHTML []byte
 //go:embed review.html
 var reviewHTML []byte
 
+//go:embed assets/*
+var iconAssets embed.FS
+
 type Server struct {
 	configPath     string
 	mu             sync.Mutex
@@ -79,6 +82,10 @@ func NewServer(configPath string) *Server {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleIndex)
+	mux.Handle("/assets/", http.FileServer(http.FS(iconAssets)))
+	mux.HandleFunc("/favicon.ico", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFileFS(w, r, iconAssets, "assets/favicon.ico")
+	})
 	mux.HandleFunc("/api/config", s.handleConfig)
 	mux.HandleFunc("/api/logs", s.handleLogs)
 	mux.HandleFunc("/api/status", s.handleStatus)
