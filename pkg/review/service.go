@@ -30,6 +30,21 @@ type Library interface {
 
 const dateFallbackTolerance = 2 * time.Hour
 
+type AlbumOption struct {
+	ID         string     `json:"id"`
+	Title      string     `json:"title"`
+	AssetCount *int       `json:"assetCount,omitempty"`
+	CreatedAt  *time.Time `json:"createdAt,omitempty"`
+}
+
+type ExistingAlbumError struct {
+	Albums []AlbumOption
+}
+
+func (e *ExistingAlbumError) Error() string {
+	return "An album with this title already exists. Choose an existing album to add the selected photos, or use a different title."
+}
+
 type Candidate struct {
 	ID         string     `json:"id"`
 	Filename   string     `json:"filename"`
@@ -48,16 +63,17 @@ type Item struct {
 	Candidates       []Candidate `json:"candidates"`
 }
 type Session struct {
-	ID        string            `json:"id"`
-	Title     string            `json:"title"`
-	CreatedAt time.Time         `json:"createdAt"`
-	Target    string            `json:"target"`
-	Status    string            `json:"status"`
-	Items     []Item            `json:"items"`
-	AlbumID   string            `json:"albumId,omitempty"`
-	Selected  map[string]string `json:"selected,omitempty"`
-	FailedIDs []string          `json:"failedIds,omitempty"`
-	Message   string            `json:"message,omitempty"`
+	ID            string            `json:"id"`
+	Title         string            `json:"title"`
+	CreatedAt     time.Time         `json:"createdAt"`
+	Target        string            `json:"target"`
+	Status        string            `json:"status"`
+	Items         []Item            `json:"items"`
+	AlbumID       string            `json:"albumId,omitempty"`
+	ExistingAlbum bool              `json:"existingAlbum,omitempty"`
+	Selected      map[string]string `json:"selected,omitempty"`
+	FailedIDs     []string          `json:"failedIds,omitempty"`
+	Message       string            `json:"message,omitempty"`
 }
 type Service struct {
 	Dir string
@@ -237,12 +253,12 @@ func (s *Service) Cancel(id, target string) (*Session, error) {
 		return nil, err
 	}
 	if session.Status != "ready" && session.Status != "cancelled" {
-		return session, fmt.Errorf("creation has already started; this preview cannot be cancelled")
+		return session, fmt.Errorf("the operation has already started; this preview cannot be cancelled")
 	}
 	session.Status = "cancelled"
 	return session, s.save(session)
 }
-func (s *Service) Confirm(ctx context.Context, id, target, title string, selected map[string]string, client Library) (*Session, error) {
+func (s *Service) Confirm(ctx context.Context, id, target, title string, selected map[string]string, existingAlbumID string, client Library) (*Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	session, err := s.load(id, target)
@@ -260,7 +276,10 @@ func (s *Service) Confirm(ctx context.Context, id, target, title string, selecte
 		return session, fmt.Errorf("creation outcome is uncertain; check Immich before creating another album")
 	}
 	if session.Status != "ready" && (title != session.Title || !reflect.DeepEqual(selected, session.Selected)) {
-		return session, fmt.Errorf("a started creation cannot change title or selection")
+		return session, fmt.Errorf("a started operation cannot change title or selection")
+	}
+	if session.Status != "ready" && existingAlbumID != "" && (!session.ExistingAlbum || existingAlbumID != session.AlbumID) {
+		return session, fmt.Errorf("a started operation cannot change its destination album")
 	}
 	if session.Status == "complete" {
 		return session, nil
@@ -291,32 +310,54 @@ func (s *Service) Confirm(ctx context.Context, id, target, title string, selecte
 	}
 	sort.Strings(ids)
 	if session.Status == "ready" {
+		session.Title = title
 		albums, err := client.GetAlbums(ctx)
 		if err != nil {
 			return session, err
 		}
+		matches := []AlbumOption{}
+		seenAlbums := map[string]bool{}
 		for _, album := range albums {
 			if album.AlbumName == title {
-				return session, fmt.Errorf("an album with this title already exists; choose a different title")
+				if album.Id == "" {
+					return session, fmt.Errorf("Immich returned an album without a valid ID; check Immich before continuing")
+				}
+				if !seenAlbums[album.Id] {
+					matches = append(matches, AlbumOption{ID: album.Id, Title: album.AlbumName, AssetCount: album.AssetCount, CreatedAt: album.CreatedAt})
+					seenAlbums[album.Id] = true
+				}
 			}
 		}
-		session.Title = title
+		if existingAlbumID == "" && len(matches) > 0 {
+			return session, &ExistingAlbumError{Albums: matches}
+		}
+		if existingAlbumID != "" && !seenAlbums[existingAlbumID] {
+			return session, fmt.Errorf("the selected album is no longer available with this title; check Immich and choose again")
+		}
 		session.Selected = selected
-		session.Status = "creating"
-		if err := s.save(session); err != nil {
-			return session, err
+		if existingAlbumID == "" {
+			session.Status = "creating"
+			if err := s.save(session); err != nil {
+				return session, err
+			}
+			albumID, err := client.CreateReviewAlbum(ctx, title)
+			if err != nil {
+				session.Status = "creation_unknown"
+				session.Message = "Check Immich: the server may have created the album. No automatic retry."
+				_ = s.save(session)
+				return session, fmt.Errorf("album creation outcome is uncertain; check Immich")
+			}
+			session.AlbumID = albumID
+		} else {
+			session.AlbumID = existingAlbumID
+			session.ExistingAlbum = true
 		}
-		albumID, err := client.CreateReviewAlbum(ctx, title)
-		if err != nil {
-			session.Status = "creation_unknown"
-			session.Message = "Check Immich: the server may have created the album. No automatic retry."
-			_ = s.save(session)
-			return session, fmt.Errorf("album creation outcome is uncertain; check Immich")
-		}
-		session.AlbumID = albumID
 		session.Status = "adding"
 		if err := s.save(session); err != nil {
-			return session, fmt.Errorf("album %s created, but journal could not be saved: %w", albumID, err)
+			if !session.ExistingAlbum {
+				return session, fmt.Errorf("album %s created, but journal could not be saved: %w", session.AlbumID, err)
+			}
+			return session, fmt.Errorf("cannot save the operation for album %s; no photos were added: %w", session.AlbumID, err)
 		}
 	}
 	if session.AlbumID == "" {
@@ -326,10 +367,10 @@ func (s *Service) Confirm(ctx context.Context, id, target, title string, selecte
 	session.FailedIDs = failed
 	if addErr != nil {
 		session.Status = "partial"
-		session.Message = "Album created. Retry to add the selected photos to the same album."
+		session.Message = "Some photos were not added. Retry to add the selected photos to the same album."
 	} else {
 		session.Status = "complete"
-		session.Message = "Album created with the selected existing photos."
+		session.Message = "The selected photos are in the album. Photos already in the album were kept."
 	}
 	if err := s.save(session); err != nil {
 		return session, err

@@ -21,6 +21,13 @@ disponibile soltanto avviando esplicitamente con `APP_MODE=sync`.
 5. Controllare titolo, candidati e date; selezionare le foto da includere.
 6. Premere **Create album** oppure **Cancel**.
 
+Se il titolo esiste già, l'app mostra gli album omonimi senza modificare Immich.
+Selezionare l'album di destinazione e premere **Add to existing album** per
+aggiungere le foto scelte, mantenendo quelle già presenti. La data di creazione,
+il numero di foto (quando forniti da Immich) e l'ID aiutano a distinguere gli
+album omonimi. Nessun album è selezionato automaticamente. Per creare invece un
+album separato, premere **Use a different title** e cambiare il titolo.
+
 Permessi della chiave: `asset.read`, `asset.view` (miniature), `album.read`,
 `album.create`, `albumAsset.create`. La ricerca vede solo le foto accessibili
 all'utente della chiave, comprese le restrizioni di condivisione di Immich.
@@ -112,15 +119,19 @@ l'album ma la risposta si perde, l'app chiede di verificare Immich: ripetere il
 POST potrebbe creare un duplicato. Non eliminare il journal per forzare una
 nuova creazione prima di questo controllo.
 
-Se l'album è stato creato e soltanto alcune aggiunte falliscono, la UI mostra
+Se soltanto alcune aggiunte falliscono, la UI mostra
 l'ID album e consente di ritentare **sullo stesso album**. Vengono controllati
 gli esiti individuali, compresi i duplicati già presenti. Dopo l'inizio della
-creazione, titolo e selezione rimangono fissi. Un album con titolo già presente
-viene segnalato prima della creazione: scegliere un titolo diverso.
+creazione o dell'integrazione, titolo, selezione e album di destinazione rimangono
+fissi, anche dopo un riavvio. Per un album esistente, la destinazione viene
+ricontrollata in Immich e salvata nel journal prima di aggiungere foto; un album
+eliminato o rinominato dopo la proposta non viene sostituito automaticamente
+con un nuovo album. Le foto già presenti non vengono rimosse e i risultati
+`duplicate` dell'API sono considerati già aggiunti.
 
 I doppi clic, le richieste contemporanee e la ripetizione dopo un riavvio sono
 gestiti tramite lo stato persistente. Annullare è possibile prima della conferma;
-non è un'operazione di eliminazione di un album già creato.
+non è un'operazione di eliminazione di un album creato o integrato.
 
 ## Verifiche di sviluppo
 

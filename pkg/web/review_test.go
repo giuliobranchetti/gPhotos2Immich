@@ -225,3 +225,113 @@ func TestReviewConfigDoesNotOverwriteInvalidFile(t *testing.T) {
 		t.Fatal("invalid config overwritten")
 	}
 }
+
+func TestReviewUpdatesAnExplicitlyChosenExistingAlbumWithoutDuplicates(t *testing.T) {
+	creates, adds := 0, 0
+	albums := []map[string]any{
+		{"id": "existing-1", "albumName": "Trip", "assetCount": 2, "createdAt": "2024-01-01T12:00:00Z", "assets": []map[string]string{{"id": "unrelated-photo"}}},
+		{"id": "existing-2", "albumName": "Trip", "assetCount": 15, "createdAt": "2025-01-01T12:00:00Z"},
+	}
+	existingPhotos := map[string]bool{"a": true, "unrelated-photo": true}
+	fake := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "POST /api/search/metadata":
+			var query map[string]any
+			json.NewDecoder(r.Body).Decode(&query)
+			name, _ := query["originalFileName"].(string)
+			id := strings.TrimSuffix(name, ".jpg")
+			if id != "a" && id != "b" {
+				t.Errorf("unexpected filename: %s", name)
+			}
+			json.NewEncoder(w).Encode(map[string]any{"assets": map[string]any{"items": []map[string]any{{"id": id, "originalFileName": name, "fileCreatedAt": "2020-01-02T03:04:05Z"}}}})
+		case "GET /api/albums":
+			json.NewEncoder(w).Encode(albums)
+		case "POST /api/albums":
+			creates++
+			t.Error("existing album update created a new album")
+			io.WriteString(w, `{"id":"wrong-new-album"}`)
+		case "PUT /api/albums/existing-1/assets":
+			adds++
+			var body struct {
+				IDs []string `json:"ids"`
+			}
+			json.NewDecoder(r.Body).Decode(&body)
+			results := []map[string]any{}
+			for _, id := range body.IDs {
+				if id != "a" && id != "b" {
+					t.Errorf("unexpected addition %s", id)
+				}
+				if existingPhotos[id] {
+					results = append(results, map[string]any{"id": id, "success": false, "error": "duplicate"})
+				} else {
+					existingPhotos[id] = true
+					results = append(results, map[string]any{"id": id, "success": true})
+				}
+			}
+			json.NewEncoder(w).Encode(results)
+		default:
+			t.Errorf("unexpected operation: %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected", 400)
+		}
+	}))
+	defer fake.Close()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	cfg, _ := json.Marshal(map[string]any{"apiURL": fake.URL + "/api", "apiKey": "private-test-key", "dataDir": dir})
+	if err := os.WriteFile(path, cfg, 0600); err != nil {
+		t.Fatal(err)
+	}
+	s := NewServer(path)
+	s.ReviewOnly = true
+	s.readAlbum = func(context.Context, string) (*googlephotos.Album, error) {
+		return &googlephotos.Album{Title: "Source title", Photos: []googlephotos.Photo{
+			{ID: "g1", OriginalFileName: "a.jpg", TakenAt: time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)},
+			{ID: "g2", OriginalFileName: "b.jpg", TakenAt: time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)},
+		}}, nil
+	}
+	preview := reviewRequest(t, s, "POST", "/api/review/preview", `{"url":"https://photos.app.goo.gl/test"}`)
+	var session review.Session
+	if err := json.Unmarshal(preview.Body.Bytes(), &session); err != nil || preview.Code != 200 {
+		t.Fatalf("preview failed: %d %s", preview.Code, preview.Body)
+	}
+	body := map[string]any{"id": session.ID, "title": "Trip", "selected": map[string]string{"g1": "a", "g2": "b"}}
+	payload, _ := json.Marshal(body)
+	conflict := reviewRequest(t, s, "POST", "/api/review/confirm", string(payload))
+	var response struct {
+		Code    string               `json:"code"`
+		Albums  []review.AlbumOption `json:"albums"`
+		Session review.Session       `json:"session"`
+	}
+	if err := json.Unmarshal(conflict.Body.Bytes(), &response); err != nil || conflict.Code != 409 || response.Code != "album_exists" || len(response.Albums) != 2 || response.Session.Status != "ready" || response.Session.Title != "Trip" || creates != 0 || adds != 0 {
+		t.Fatalf("existing albums were not offered without writes: %d %s", conflict.Code, conflict.Body)
+	}
+	if strings.Contains(conflict.Body.String(), "unrelated-photo") || strings.Contains(conflict.Body.String(), "private-test-key") || response.Albums[0].CreatedAt == nil || response.Albums[0].AssetCount == nil || *response.Albums[0].AssetCount != 2 {
+		t.Fatal("album options leaked assets/credentials or omitted decision metadata")
+	}
+	body["existingAlbumId"] = "foreign"
+	payload, _ = json.Marshal(body)
+	if w := reviewRequest(t, s, "POST", "/api/review/confirm", string(payload)); w.Code != 409 || adds != 0 || creates != 0 {
+		t.Fatal("foreign destination accepted")
+	}
+	// Recheck the destination against Immich if it disappears after being offered.
+	originalAlbums := albums
+	albums = albums[1:]
+	body["existingAlbumId"] = "existing-1"
+	payload, _ = json.Marshal(body)
+	if w := reviewRequest(t, s, "POST", "/api/review/confirm", string(payload)); w.Code != 409 || adds != 0 || creates != 0 {
+		t.Fatal("stale destination created or updated an album")
+	}
+	albums = originalAlbums
+	updated := reviewRequest(t, s, "POST", "/api/review/confirm", string(payload))
+	if err := json.Unmarshal(updated.Body.Bytes(), &session); err != nil || updated.Code != 200 || session.Status != "complete" || !session.ExistingAlbum || session.AlbumID != "existing-1" || creates != 0 || adds != 1 {
+		t.Fatalf("existing album update failed: %d %s", updated.Code, updated.Body)
+	}
+	if len(existingPhotos) != 3 || !existingPhotos["a"] || !existingPhotos["b"] || !existingPhotos["unrelated-photo"] {
+		t.Fatalf("existing contents were not preserved: %v", existingPhotos)
+	}
+	restarted := NewServer(path)
+	repeated := reviewRequest(t, restarted, "POST", "/api/review/confirm", string(payload))
+	if repeated.Code != 200 || adds != 1 || creates != 0 {
+		t.Fatalf("restarted update repeated writes: %d %s", repeated.Code, repeated.Body)
+	}
+}

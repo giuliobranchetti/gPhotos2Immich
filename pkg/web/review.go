@@ -18,6 +18,7 @@ import (
 	"warreth.dev/gphotos2immich/pkg/config"
 	"warreth.dev/gphotos2immich/pkg/googlephotos"
 	"warreth.dev/gphotos2immich/pkg/immich"
+	"warreth.dev/gphotos2immich/pkg/review"
 )
 
 func replyJSON(w http.ResponseWriter, status int, v any) {
@@ -151,9 +152,10 @@ func (s *Server) handleReview(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var request struct {
-			ID       string            `json:"id"`
-			Title    string            `json:"title"`
-			Selected map[string]string `json:"selected"`
+			ID              string            `json:"id"`
+			Title           string            `json:"title"`
+			Selected        map[string]string `json:"selected"`
+			ExistingAlbumID string            `json:"existingAlbumId"`
 		}
 		if err := decodeReview(w, r, &request); err != nil {
 			reviewError(w, 400, err)
@@ -162,9 +164,15 @@ func (s *Server) handleReview(w http.ResponseWriter, r *http.Request) {
 		// Finish journalling even if the browser disconnects after confirmation.
 		commitCtx, stop := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
 		defer stop()
-		session, err := s.reviews.Confirm(commitCtx, request.ID, target, request.Title, request.Selected, client)
+		session, err := s.reviews.Confirm(commitCtx, request.ID, target, request.Title, request.Selected, request.ExistingAlbumID, client)
 		if err != nil {
-			replyJSON(w, 409, map[string]any{"error": err.Error(), "session": session})
+			response := map[string]any{"error": err.Error(), "session": session}
+			var existing *review.ExistingAlbumError
+			if errors.As(err, &existing) {
+				response["code"] = "album_exists"
+				response["albums"] = existing.Albums
+			}
+			replyJSON(w, 409, response)
 			return
 		}
 		replyJSON(w, 200, session)
