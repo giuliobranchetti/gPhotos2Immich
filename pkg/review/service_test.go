@@ -22,6 +22,11 @@ type library struct {
 	albums                  []immich.Album
 	creates, adds, searches int
 	createErr, addErr       error
+	albumErr                error
+	albumReads              int
+	albumAssets             map[string][]immich.ReviewAsset
+	membershipErr           error
+	membershipReads         int
 	dateAssets              []immich.ReviewAsset
 	dateSearches            int
 	dateErr                 error
@@ -41,7 +46,14 @@ func (l *library) SearchOriginalFilename(_ context.Context, n string) ([]immich.
 	l.searches++
 	return l.assets[n], nil
 }
-func (l *library) GetAlbums(context.Context) ([]immich.Album, error) { return l.albums, nil }
+func (l *library) GetAlbums(context.Context) ([]immich.Album, error) {
+	l.albumReads++
+	return l.albums, l.albumErr
+}
+func (l *library) SearchReviewAlbumAssets(_ context.Context, albumID string) ([]immich.ReviewAsset, error) {
+	l.membershipReads++
+	return l.albumAssets[albumID], l.membershipErr
+}
 func (l *library) CreateReviewAlbum(context.Context, string) (string, error) {
 	l.creates++
 	return "album-1", l.createErr
@@ -310,6 +322,106 @@ func TestTraversalAndChangedSelection(t *testing.T) {
 	s.Confirm(context.Background(), p.ID, "target", "Trip", map[string]string{"g1": "a"}, "", l)
 	if _, err := s.Confirm(context.Background(), p.ID, "target", "Changed", map[string]string{"g1": "a"}, "", l); err == nil {
 		t.Fatal("changed title accepted after creation")
+	}
+}
+
+func TestCheckAlbumsBeforeConfirmationIsReadOnly(t *testing.T) {
+	s, p, l := prepare(t)
+	count := 79
+	l.albums = []immich.Album{
+		{Id: "first", AlbumName: "Trip", AssetCount: &count},
+		{Id: "first", AlbumName: "Trip"},
+		{Id: "second", AlbumName: "Trip"},
+		{Id: "other", AlbumName: "Other"},
+	}
+	journal := filepath.Join(s.Dir, p.ID+".json")
+	before, _ := os.ReadFile(journal)
+	albums, err := s.CheckAlbums(context.Background(), p.ID, "target", "  Trip  ", l)
+	if err != nil || len(albums) != 2 || albums[0].ID != "first" || albums[1].ID != "second" || albums[0].AssetCount == nil || *albums[0].AssetCount != count {
+		t.Fatalf("existing albums not detected before confirmation: %+v %v", albums, err)
+	}
+	albums, err = s.CheckAlbums(context.Background(), p.ID, "target", "Other", l)
+	if err != nil || len(albums) != 1 || albums[0].ID != "other" {
+		t.Fatalf("changed title not checked: %+v %v", albums, err)
+	}
+	albums, err = s.CheckAlbums(context.Background(), p.ID, "target", "New trip", l)
+	if err != nil || albums == nil || len(albums) != 0 {
+		t.Fatalf("unused title did not return an empty list: %+v %v", albums, err)
+	}
+	after, _ := os.ReadFile(journal)
+	if string(before) != string(after) || l.creates != 0 || l.adds != 0 {
+		t.Fatal("checking destinations changed the preview or Immich")
+	}
+	l.albumErr = errors.New("album access denied")
+	if _, err := s.CheckAlbums(context.Background(), p.ID, "target", "Trip", l); !errors.Is(err, l.albumErr) {
+		t.Fatalf("album lookup failure was hidden: %v", err)
+	}
+	l.albumErr = nil
+	l.albums = []immich.Album{{AlbumName: "Trip"}}
+	if _, err := s.CheckAlbums(context.Background(), p.ID, "target", "Trip", l); err == nil {
+		t.Fatal("album without ID offered as a destination")
+	}
+}
+
+func TestCheckAlbumsRejectsUnavailablePreviews(t *testing.T) {
+	for _, kind := range []string{"foreign", "expired", "cancelled", "adding", "invalid_title"} {
+		t.Run(kind, func(t *testing.T) {
+			s, p, l := prepare(t)
+			target, title := "target", "Trip"
+			switch kind {
+			case "foreign":
+				target = "other"
+			case "expired":
+				p.CreatedAt = time.Now().Add(-25 * time.Hour)
+			case "cancelled", "adding":
+				p.Status = kind
+			case "invalid_title":
+				title = " "
+			}
+			if err := s.save(p); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := s.CheckAlbums(context.Background(), p.ID, target, title, l); err == nil || l.albumReads != 0 {
+				t.Fatalf("invalid check queried Immich or succeeded: %v, reads=%d", err, l.albumReads)
+			}
+		})
+	}
+}
+
+func TestAlbumMembershipIsScopedToDestinationAndPreview(t *testing.T) {
+	s, p, l := prepare(t)
+	p.Items[0].Candidates = append(p.Items[0].Candidates, Candidate{ID: "b", Filename: "a.jpg"})
+	if err := s.save(p); err != nil {
+		t.Fatal(err)
+	}
+	l.albums = []immich.Album{{Id: "first", AlbumName: "Trip"}, {Id: "second", AlbumName: "Trip"}}
+	l.albumAssets = map[string][]immich.ReviewAsset{
+		"first":  {{ID: "a"}, {ID: "unrelated"}, {ID: "a"}, {}},
+		"second": {{ID: "b"}},
+	}
+	journal := filepath.Join(s.Dir, p.ID+".json")
+	before, _ := os.ReadFile(journal)
+	for _, tc := range []struct{ album, asset string }{{"first", "a"}, {"second", "b"}} {
+		ids, err := s.AlbumMembership(context.Background(), p.ID, "target", "Trip", tc.album, l)
+		if err != nil || !reflect.DeepEqual(ids, []string{tc.asset}) {
+			t.Fatalf("membership leaked or mixed album contents: %v %v", ids, err)
+		}
+	}
+	for _, tc := range []struct{ target, title, album string }{
+		{"target", "Trip", "foreign"}, {"other", "Trip", "first"}, {"target", "Renamed", "first"},
+	} {
+		if _, err := s.AlbumMembership(context.Background(), p.ID, tc.target, tc.title, tc.album, l); err == nil || l.membershipReads != 2 {
+			t.Fatalf("invalid destination fetched membership: %+v %v", tc, err)
+		}
+	}
+	l.membershipErr = errors.New("membership access denied")
+	ids, err := s.AlbumMembership(context.Background(), p.ID, "target", "Trip", "first", l)
+	if !errors.Is(err, l.membershipErr) || ids != nil {
+		t.Fatalf("failed lookup treated as an empty album: %v %v", ids, err)
+	}
+	after, _ := os.ReadFile(journal)
+	if string(before) != string(after) || l.creates != 0 || l.adds != 0 {
+		t.Fatal("reading membership changed the preview or Immich")
 	}
 }
 

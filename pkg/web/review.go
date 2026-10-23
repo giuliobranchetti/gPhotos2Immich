@@ -89,6 +89,49 @@ func (s *Server) handleReview(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
 	defer cancel()
 	switch r.URL.Path {
+	case "/api/review/album-membership":
+		if r.Method != http.MethodPost {
+			reviewError(w, 405, fmt.Errorf("POST required"))
+			return
+		}
+		var request struct {
+			ID      string `json:"id"`
+			Title   string `json:"title"`
+			AlbumID string `json:"albumId"`
+		}
+		if err := decodeReview(w, r, &request); err != nil {
+			reviewError(w, 400, err)
+			return
+		}
+		membershipCtx, stop := context.WithTimeout(ctx, 2*time.Minute)
+		defer stop()
+		ids, err := s.reviews.AlbumMembership(membershipCtx, request.ID, target, request.Title, request.AlbumID, client)
+		if err != nil {
+			reviewError(w, 502, fmt.Errorf("could not check photos already in the album: %w", err))
+			return
+		}
+		replyJSON(w, 200, map[string]any{"assetIds": ids})
+	case "/api/review/albums":
+		if r.Method != http.MethodPost {
+			reviewError(w, 405, fmt.Errorf("POST required"))
+			return
+		}
+		var request struct {
+			ID    string `json:"id"`
+			Title string `json:"title"`
+		}
+		if err := decodeReview(w, r, &request); err != nil {
+			reviewError(w, 400, err)
+			return
+		}
+		checkCtx, stop := context.WithTimeout(ctx, 30*time.Second)
+		defer stop()
+		albums, err := s.reviews.CheckAlbums(checkCtx, request.ID, target, request.Title, client)
+		if err != nil {
+			reviewError(w, 502, fmt.Errorf("could not check existing albums: %w", err))
+			return
+		}
+		replyJSON(w, 200, map[string]any{"albums": albums})
 	case "/api/review/preview":
 		if r.Method != http.MethodPost {
 			reviewError(w, 405, fmt.Errorf("POST required"))

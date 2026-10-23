@@ -21,12 +21,37 @@ disponibile soltanto avviando esplicitamente con `APP_MODE=sync`.
 5. Controllare titolo, candidati e date; selezionare le foto da includere.
 6. Premere **Create album** oppure **Cancel**.
 
-Se il titolo esiste già, l'app mostra gli album omonimi senza modificare Immich.
+L'app controlla gli album omonimi appena l'anteprima è pronta, dopo un ripristino
+e quando si modifica il titolo. Mostra il controllo in corso accanto al titolo;
+se Immich non risponde, visualizza l'errore e permette di ritentare. La conferma
+rimane disabilitata finché il controllo non termina correttamente.
+Se il titolo esiste già, l'app mostra subito gli album omonimi sotto il titolo,
+senza modificare Immich e senza dover premere prima **Create album**.
 Selezionare l'album di destinazione e premere **Add to existing album** per
 aggiungere le foto scelte, mantenendo quelle già presenti. La data di creazione,
 il numero di foto (quando forniti da Immich) e l'ID aiutano a distinguere gli
 album omonimi. Nessun album è selezionato automaticamente. Per creare invece un
 album separato, premere **Use a different title** e cambiare il titolo.
+Quando si sceglie un album esistente, l'app legge tutte le pagine delle foto
+contenute in quell'album. I candidati già presenti ricevono il tag **Already in
+album**; le corrispondenze selezionate già presenti vengono deselezionate
+automaticamente. Il filtro **Already in album** aiuta a controllarle. Le
+alternative per data mantengono la selezione manuale e i candidati ambigui
+rimangono distinti: una foto diversa con lo stesso nome non viene esclusa solo
+perché un altro candidato è nell'album.
+
+Si possono riselezionare le foto già presenti; Immich le salterà come duplicati.
+Cambiare album ricalcola le presenze per la nuova destinazione e ripristina le
+selezioni tolte automaticamente per quella precedente, conservando le scelte
+modificate manualmente. Se il controllo fallisce, la conferma resta disabilitata
+e compare **Retry photo check**. Se tutte le foto selezionate sono già presenti,
+non rimane nulla da aggiungere e il pulsante di conferma resta disabilitato.
+L'esclusione riguarda soltanto questa aggiunta: le foto nell'album vengono
+conservate.
+
+Alla conferma il server ricontrolla comunque gli album, per rilevare modifiche
+avvenute dopo l'anteprima. La ricerca vede gli album accessibili alla chiave API
+della connessione configurata.
 
 Permessi della chiave: `asset.read`, `asset.view` (miniature), `album.read`,
 `album.create`, `albumAsset.create`. La ricerca vede solo le foto accessibili

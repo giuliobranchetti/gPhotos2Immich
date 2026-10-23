@@ -238,6 +238,10 @@ func TestReviewUpdatesAnExplicitlyChosenExistingAlbumWithoutDuplicates(t *testin
 		case "POST /api/search/metadata":
 			var query map[string]any
 			json.NewDecoder(r.Body).Decode(&query)
+			if query["albumIds"] != nil {
+				io.WriteString(w, `{"assets":{"items":[{"id":"a"},{"id":"unrelated-photo"}]}}`)
+				return
+			}
 			name, _ := query["originalFileName"].(string)
 			id := strings.TrimSuffix(name, ".jpg")
 			if id != "a" && id != "b" {
@@ -295,6 +299,34 @@ func TestReviewUpdatesAnExplicitlyChosenExistingAlbumWithoutDuplicates(t *testin
 		t.Fatalf("preview failed: %d %s", preview.Code, preview.Body)
 	}
 	body := map[string]any{"id": session.ID, "title": "Trip", "selected": map[string]string{"g1": "a", "g2": "b"}}
+	// The UI can offer destinations before the user clicks Create album.
+	checkPayload, _ := json.Marshal(map[string]string{"id": session.ID, "title": "Trip"})
+	checked := reviewRequest(t, s, "POST", "/api/review/albums", string(checkPayload))
+	var available struct {
+		Albums []review.AlbumOption `json:"albums"`
+	}
+	if err := json.Unmarshal(checked.Body.Bytes(), &available); err != nil || checked.Code != 200 || len(available.Albums) != 2 || available.Albums[0].ID != "existing-1" || creates != 0 || adds != 0 {
+		t.Fatalf("early album check failed or wrote to Immich: %d %s", checked.Code, checked.Body)
+	}
+	if checked.Header().Get("Cache-Control") != "no-store" || strings.Contains(checked.Body.String(), "unrelated-photo") || strings.Contains(checked.Body.String(), "private-test-key") {
+		t.Fatal("early album check cached or leaked private data")
+	}
+	restored := reviewRequest(t, s, "GET", "/api/review/session?id="+session.ID, "")
+	var unchanged review.Session
+	if err := json.Unmarshal(restored.Body.Bytes(), &unchanged); err != nil || unchanged.Title != "Source title" || unchanged.Status != "ready" || unchanged.AlbumID != "" || len(unchanged.Selected) != 0 {
+		t.Fatalf("early album check changed the preview: %s", restored.Body)
+	}
+	membershipPayload, _ := json.Marshal(map[string]string{"id": session.ID, "title": "Trip", "albumId": "existing-1"})
+	membership := reviewRequest(t, s, "POST", "/api/review/album-membership", string(membershipPayload))
+	var present struct {
+		AssetIDs []string `json:"assetIds"`
+	}
+	if err := json.Unmarshal(membership.Body.Bytes(), &present); err != nil || membership.Code != 200 || len(present.AssetIDs) != 1 || present.AssetIDs[0] != "a" || creates != 0 || adds != 0 {
+		t.Fatalf("membership failed or wrote to Immich: %d %s", membership.Code, membership.Body)
+	}
+	if membership.Header().Get("Cache-Control") != "no-store" || strings.Contains(membership.Body.String(), "unrelated-photo") || strings.Contains(membership.Body.String(), "private-test-key") {
+		t.Fatal("membership cached or leaked unrelated album data")
+	}
 	payload, _ := json.Marshal(body)
 	conflict := reviewRequest(t, s, "POST", "/api/review/confirm", string(payload))
 	var response struct {

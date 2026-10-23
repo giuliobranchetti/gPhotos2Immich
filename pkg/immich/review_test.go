@@ -135,6 +135,65 @@ func TestSearchTakenRangeRejectsInvalidRange(t *testing.T) {
 		}
 	}
 }
+func TestSearchReviewAlbumAssetsPaginatesWithAlbumFilter(t *testing.T) {
+	for _, cursor := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cursor=%t", cursor), func(t *testing.T) {
+			calls := 0
+			c := reviewTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var q map[string]any
+				json.NewDecoder(r.Body).Decode(&q)
+				if r.Method != "POST" || r.URL.Path != "/api/search/metadata" || q["withStacked"] != true || q["size"] != float64(1000) || q["originalFileName"] != nil || q["takenAfter"] != nil {
+					t.Fatalf("wrong membership query: %v", q)
+				}
+				if cursor && calls == 2 {
+					filter := q["filter"].(map[string]any)["albumIds"].(map[string]any)["any"].([]any)
+					if q["cursor"] != "next" || q["page"] != nil || len(filter) != 1 || filter[0] != "album-1" {
+						t.Fatalf("cursor lost the destination album: %v", q)
+					}
+				} else {
+					ids := q["albumIds"].([]any)
+					if len(ids) != 1 || ids[0] != "album-1" || q["page"] != float64(calls) {
+						t.Fatalf("page lost the destination album: %v", q)
+					}
+				}
+				next := ""
+				if calls == 1 {
+					if cursor {
+						next = `,"nextCursor":"next"`
+					} else {
+						next = `,"nextPage":"2"`
+					}
+				}
+				fmt.Fprintf(w, `{"assets":{"items":[{"id":"a"},{"id":"page-%d"},{"id":""}]%s}}`, calls, next)
+			}))
+			assets, err := c.SearchReviewAlbumAssets(context.Background(), "album-1")
+			if err != nil || len(assets) != 3 || calls != 2 || assets[2].ID != "page-2" {
+				t.Fatalf("incomplete or duplicated membership: %+v %v calls=%d", assets, err, calls)
+			}
+		})
+	}
+}
+
+func TestSearchReviewAlbumAssetsRejectsIncompleteResults(t *testing.T) {
+	calls := 0
+	c := reviewTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			io.WriteString(w, `{"assets":{"items":[{"id":"a"}],"nextPage":"2"}}`)
+		} else {
+			io.WriteString(w, `{"error":"album not accessible"}`)
+		}
+	}))
+	assets, err := c.SearchReviewAlbumAssets(context.Background(), "album-1")
+	if err == nil || assets != nil || calls != 2 {
+		t.Fatalf("partial membership treated as complete: %+v %v calls=%d", assets, err, calls)
+	}
+	if _, err := c.SearchReviewAlbumAssets(context.Background(), ""); err == nil || calls != 2 {
+		t.Fatal("empty destination ID sent to Immich")
+	}
+}
+
 func TestCreateAlbumNeverRetriesServerFailure(t *testing.T) {
 	calls := 0
 	c := reviewTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; http.Error(w, "lost", 500) }))

@@ -77,6 +77,25 @@ func (c *Client) SearchTakenRange(ctx context.Context, after, before time.Time, 
 	})
 }
 
+// SearchReviewAlbumAssets reads every page, including Immich 3.2+ cursors.
+// Recent Immich versions no longer include assets in GET /albums/{id}.
+func (c *Client) SearchReviewAlbumAssets(ctx context.Context, albumID string) ([]ReviewAsset, error) {
+	if albumID == "" {
+		return nil, fmt.Errorf("missing destination album ID")
+	}
+	return c.searchReviewAssets(ctx, func(page int, cursor string) map[string]any {
+		query := map[string]any{"size": 1000, "withStacked": true}
+		if cursor != "" {
+			query["cursor"] = cursor
+			query["filter"] = map[string]any{"albumIds": map[string]any{"any": []string{albumID}}}
+		} else {
+			query["page"] = page
+			query["albumIds"] = []string{albumID}
+		}
+		return query
+	}, func(ReviewAsset) bool { return true })
+}
+
 func (c *Client) searchReviewAssets(ctx context.Context, queryForPage func(int, string) map[string]any, matches func(ReviewAsset) bool) ([]ReviewAsset, error) {
 	result := []ReviewAsset{}
 	seen := map[string]bool{}

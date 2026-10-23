@@ -24,6 +24,7 @@ type Library interface {
 	SearchOriginalFilename(context.Context, string) ([]immich.ReviewAsset, error)
 	SearchTakenRange(context.Context, time.Time, time.Time, bool) ([]immich.ReviewAsset, error)
 	GetAlbums(context.Context) ([]immich.Album, error)
+	SearchReviewAlbumAssets(context.Context, string) ([]immich.ReviewAsset, error)
 	CreateReviewAlbum(context.Context, string) (string, error)
 	AddReviewAssets(context.Context, string, []string) ([]string, error)
 }
@@ -258,6 +259,87 @@ func (s *Service) Cancel(id, target string) (*Session, error) {
 	session.Status = "cancelled"
 	return session, s.save(session)
 }
+
+// CheckAlbums is read-only: the destination is still rechecked on confirmation.
+func (s *Service) CheckAlbums(ctx context.Context, id, target, title string, client Library) ([]AlbumOption, error) {
+	session, err := s.Get(id, target)
+	if err != nil {
+		return nil, err
+	}
+	if session.Status != "ready" || time.Since(session.CreatedAt) > 24*time.Hour {
+		return nil, fmt.Errorf("preview is no longer ready; generate it again")
+	}
+	title = strings.TrimSpace(title)
+	if title == "" || len(title) > 500 {
+		return nil, fmt.Errorf("enter an album title of at most 500 bytes")
+	}
+	return matchingAlbums(ctx, title, client)
+}
+
+// AlbumMembership exposes only candidate IDs from this preview, never unrelated
+// album contents. Choosing a destination here does not start an operation.
+func (s *Service) AlbumMembership(ctx context.Context, id, target, title, albumID string, client Library) ([]string, error) {
+	options, err := s.CheckAlbums(ctx, id, target, title, client)
+	if err != nil {
+		return nil, err
+	}
+	available := false
+	for _, option := range options {
+		if option.ID == albumID {
+			available = true
+			break
+		}
+	}
+	if !available {
+		return nil, fmt.Errorf("the selected album is no longer available with this title; check Immich and choose again")
+	}
+	session, err := s.Get(id, target)
+	if err != nil {
+		return nil, err
+	}
+	assets, err := client.SearchReviewAlbumAssets(ctx, albumID)
+	if err != nil {
+		return nil, err
+	}
+	allowed := map[string]bool{}
+	for _, item := range session.Items {
+		for _, candidate := range item.Candidates {
+			allowed[candidate.ID] = true
+		}
+	}
+	present := []string{}
+	for _, asset := range assets {
+		if allowed[asset.ID] {
+			present = append(present, asset.ID)
+			delete(allowed, asset.ID)
+		}
+	}
+	sort.Strings(present)
+	return present, nil
+}
+
+func matchingAlbums(ctx context.Context, title string, client Library) ([]AlbumOption, error) {
+	albums, err := client.GetAlbums(ctx)
+	if err != nil {
+		return nil, err
+	}
+	matches := []AlbumOption{}
+	seen := map[string]bool{}
+	for _, album := range albums {
+		if album.AlbumName != title {
+			continue
+		}
+		if album.Id == "" {
+			return nil, fmt.Errorf("Immich returned an album without a valid ID; check Immich before continuing")
+		}
+		if !seen[album.Id] {
+			matches = append(matches, AlbumOption{ID: album.Id, Title: album.AlbumName, AssetCount: album.AssetCount, CreatedAt: album.CreatedAt})
+			seen[album.Id] = true
+		}
+	}
+	return matches, nil
+}
+
 func (s *Service) Confirm(ctx context.Context, id, target, title string, selected map[string]string, existingAlbumID string, client Library) (*Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -311,22 +393,13 @@ func (s *Service) Confirm(ctx context.Context, id, target, title string, selecte
 	sort.Strings(ids)
 	if session.Status == "ready" {
 		session.Title = title
-		albums, err := client.GetAlbums(ctx)
+		matches, err := matchingAlbums(ctx, title, client)
 		if err != nil {
 			return session, err
 		}
-		matches := []AlbumOption{}
 		seenAlbums := map[string]bool{}
-		for _, album := range albums {
-			if album.AlbumName == title {
-				if album.Id == "" {
-					return session, fmt.Errorf("Immich returned an album without a valid ID; check Immich before continuing")
-				}
-				if !seenAlbums[album.Id] {
-					matches = append(matches, AlbumOption{ID: album.Id, Title: album.AlbumName, AssetCount: album.AssetCount, CreatedAt: album.CreatedAt})
-					seenAlbums[album.Id] = true
-				}
-			}
+		for _, album := range matches {
+			seenAlbums[album.ID] = true
 		}
 		if existingAlbumID == "" && len(matches) > 0 {
 			return session, &ExistingAlbumError{Albums: matches}
