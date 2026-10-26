@@ -21,6 +21,38 @@ disponibile soltanto avviando esplicitamente con `APP_MODE=sync`.
 5. Controllare titolo, candidati e date; selezionare le foto da includere.
 6. Premere **Create album** oppure **Cancel**.
 
+L'app controlla gli album omonimi appena l'anteprima è pronta, dopo un ripristino
+e quando si modifica il titolo. Mostra il controllo in corso accanto al titolo;
+se Immich non risponde, visualizza l'errore e permette di ritentare. La conferma
+rimane disabilitata finché il controllo non termina correttamente.
+Se il titolo esiste già, l'app mostra subito gli album omonimi sotto il titolo,
+senza modificare Immich e senza dover premere prima **Create album**.
+Selezionare l'album di destinazione e premere **Add to existing album** per
+aggiungere le foto scelte, mantenendo quelle già presenti. La data di creazione,
+il numero di foto (quando forniti da Immich) e l'ID aiutano a distinguere gli
+album omonimi. Nessun album è selezionato automaticamente. Per creare invece un
+album separato, premere **Use a different title** e cambiare il titolo.
+Quando si sceglie un album esistente, l'app legge tutte le pagine delle foto
+contenute in quell'album. I candidati già presenti ricevono il tag **Already in
+album**; le corrispondenze selezionate già presenti vengono deselezionate
+automaticamente. Il filtro **Already in album** aiuta a controllarle. Le
+alternative per data mantengono la selezione manuale e i candidati ambigui
+rimangono distinti: una foto diversa con lo stesso nome non viene esclusa solo
+perché un altro candidato è nell'album.
+
+Si possono riselezionare le foto già presenti; Immich le salterà come duplicati.
+Cambiare album ricalcola le presenze per la nuova destinazione e ripristina le
+selezioni tolte automaticamente per quella precedente, conservando le scelte
+modificate manualmente. Se il controllo fallisce, la conferma resta disabilitata
+e compare **Retry photo check**. Se tutte le foto selezionate sono già presenti,
+non rimane nulla da aggiungere e il pulsante di conferma resta disabilitato.
+L'esclusione riguarda soltanto questa aggiunta: le foto nell'album vengono
+conservate.
+
+Alla conferma il server ricontrolla comunque gli album, per rilevare modifiche
+avvenute dopo l'anteprima. La ricerca vede gli album accessibili alla chiave API
+della connessione configurata.
+
 Permessi della chiave: `asset.read`, `asset.view` (miniature), `album.read`,
 `album.create`, `albumAsset.create`. La ricerca vede solo le foto accessibili
 all'utente della chiave, comprese le restrizioni di condivisione di Immich.
@@ -79,10 +111,20 @@ docker compose --env-file dev/.env -f dev/compose.yml down
   di caricamento `createdAt` non è usato.
 - Tolleranza di un secondo per la precisione dei metadati.
 - Se manca una data, il candidato rimane visibile come **Check date**.
-- Il primo candidato visualizzato è sempre preselezionato, anche con data
-  diversa, data assente o più risultati. Le corrispondenze con la stessa data
+- Per le corrispondenze per nome, il primo candidato visualizzato è
+  preselezionato, anche con data diversa, data assente o più risultati.
+  Le corrispondenze con la stessa data
   vengono mostrate per prime. Si può scegliere un altro candidato o escludere
-  la foto prima della conferma. Le foto senza candidati rimangono escluse.
+  la foto prima della conferma.
+- Se la ricerca per nome non trova candidati e Google fornisce la data di
+  scatto, viene eseguita una seconda ricerca nell'intervallo inclusivo di
+  **±2 ore**. Le alternative possono avere nomi diversi e sono ordinate per
+  vicinanza all'istante originale, confrontando i fusi orari correttamente.
+  Foto e video vengono cercati separatamente. La UI le contrassegna come
+  **Date alternatives (±2 hours)** e richiede di selezionarle manualmente:
+  non sono preselezionate, nemmeno quando esiste un solo candidato.
+  La ricerca legge tutte le pagine Immich e non modifica la libreria.
+  Le foto senza candidati rimangono escluse.
 - I nomi vengono letti con HEAD e Content-Disposition; nessun originale viene
   scaricato. Per i video si usa la variante `=dv`. Formati senza intestazione
   utilizzabile restano indicati come **Filename unavailable**.
@@ -102,15 +144,19 @@ l'album ma la risposta si perde, l'app chiede di verificare Immich: ripetere il
 POST potrebbe creare un duplicato. Non eliminare il journal per forzare una
 nuova creazione prima di questo controllo.
 
-Se l'album è stato creato e soltanto alcune aggiunte falliscono, la UI mostra
+Se soltanto alcune aggiunte falliscono, la UI mostra
 l'ID album e consente di ritentare **sullo stesso album**. Vengono controllati
 gli esiti individuali, compresi i duplicati già presenti. Dopo l'inizio della
-creazione, titolo e selezione rimangono fissi. Un album con titolo già presente
-viene segnalato prima della creazione: scegliere un titolo diverso.
+creazione o dell'integrazione, titolo, selezione e album di destinazione rimangono
+fissi, anche dopo un riavvio. Per un album esistente, la destinazione viene
+ricontrollata in Immich e salvata nel journal prima di aggiungere foto; un album
+eliminato o rinominato dopo la proposta non viene sostituito automaticamente
+con un nuovo album. Le foto già presenti non vengono rimosse e i risultati
+`duplicate` dell'API sono considerati già aggiunti.
 
 I doppi clic, le richieste contemporanee e la ripetizione dopo un riavvio sono
 gestiti tramite lo stato persistente. Annullare è possibile prima della conferma;
-non è un'operazione di eliminazione di un album già creato.
+non è un'operazione di eliminazione di un album creato o integrato.
 
 ## Verifiche di sviluppo
 

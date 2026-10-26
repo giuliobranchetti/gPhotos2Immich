@@ -22,9 +22,11 @@ const (
 )
 
 type Album struct {
-	AlbumName string `json:"albumName"`
-	Id        string `json:"id"`
-	Assets    []struct {
+	AlbumName  string     `json:"albumName"`
+	Id         string     `json:"id"`
+	AssetCount *int       `json:"assetCount,omitempty"`
+	CreatedAt  *time.Time `json:"createdAt,omitempty"`
+	Assets     []struct {
 		Id               string `json:"id"`
 		OriginalFileName string `json:"originalFileName"`
 	} `json:"assets"`

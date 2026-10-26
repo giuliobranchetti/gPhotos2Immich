@@ -18,6 +18,7 @@ import (
 	"warreth.dev/gphotos2immich/pkg/config"
 	"warreth.dev/gphotos2immich/pkg/googlephotos"
 	"warreth.dev/gphotos2immich/pkg/immich"
+	"warreth.dev/gphotos2immich/pkg/review"
 )
 
 func replyJSON(w http.ResponseWriter, status int, v any) {
@@ -88,6 +89,49 @@ func (s *Server) handleReview(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Minute)
 	defer cancel()
 	switch r.URL.Path {
+	case "/api/review/album-membership":
+		if r.Method != http.MethodPost {
+			reviewError(w, 405, fmt.Errorf("POST required"))
+			return
+		}
+		var request struct {
+			ID      string `json:"id"`
+			Title   string `json:"title"`
+			AlbumID string `json:"albumId"`
+		}
+		if err := decodeReview(w, r, &request); err != nil {
+			reviewError(w, 400, err)
+			return
+		}
+		membershipCtx, stop := context.WithTimeout(ctx, 2*time.Minute)
+		defer stop()
+		ids, err := s.reviews.AlbumMembership(membershipCtx, request.ID, target, request.Title, request.AlbumID, client)
+		if err != nil {
+			reviewError(w, 502, fmt.Errorf("could not check photos already in the album: %w", err))
+			return
+		}
+		replyJSON(w, 200, map[string]any{"assetIds": ids})
+	case "/api/review/albums":
+		if r.Method != http.MethodPost {
+			reviewError(w, 405, fmt.Errorf("POST required"))
+			return
+		}
+		var request struct {
+			ID    string `json:"id"`
+			Title string `json:"title"`
+		}
+		if err := decodeReview(w, r, &request); err != nil {
+			reviewError(w, 400, err)
+			return
+		}
+		checkCtx, stop := context.WithTimeout(ctx, 30*time.Second)
+		defer stop()
+		albums, err := s.reviews.CheckAlbums(checkCtx, request.ID, target, request.Title, client)
+		if err != nil {
+			reviewError(w, 502, fmt.Errorf("could not check existing albums: %w", err))
+			return
+		}
+		replyJSON(w, 200, map[string]any{"albums": albums})
 	case "/api/review/preview":
 		if r.Method != http.MethodPost {
 			reviewError(w, 405, fmt.Errorf("POST required"))
@@ -151,9 +195,10 @@ func (s *Server) handleReview(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var request struct {
-			ID       string            `json:"id"`
-			Title    string            `json:"title"`
-			Selected map[string]string `json:"selected"`
+			ID              string            `json:"id"`
+			Title           string            `json:"title"`
+			Selected        map[string]string `json:"selected"`
+			ExistingAlbumID string            `json:"existingAlbumId"`
 		}
 		if err := decodeReview(w, r, &request); err != nil {
 			reviewError(w, 400, err)
@@ -162,9 +207,15 @@ func (s *Server) handleReview(w http.ResponseWriter, r *http.Request) {
 		// Finish journalling even if the browser disconnects after confirmation.
 		commitCtx, stop := context.WithTimeout(context.WithoutCancel(r.Context()), 5*time.Minute)
 		defer stop()
-		session, err := s.reviews.Confirm(commitCtx, request.ID, target, request.Title, request.Selected, client)
+		session, err := s.reviews.Confirm(commitCtx, request.ID, target, request.Title, request.Selected, request.ExistingAlbumID, client)
 		if err != nil {
-			replyJSON(w, 409, map[string]any{"error": err.Error(), "session": session})
+			response := map[string]any{"error": err.Error(), "session": session}
+			var existing *review.ExistingAlbumError
+			if errors.As(err, &existing) {
+				response["code"] = "album_exists"
+				response["albums"] = existing.Albums
+			}
+			replyJSON(w, 409, response)
 			return
 		}
 		replyJSON(w, 200, session)

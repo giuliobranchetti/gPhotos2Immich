@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 type reviewTransport func(*http.Request) (*http.Response, error)
@@ -58,6 +60,140 @@ func TestSearchSupportsCursorAndRejectsRepeatedCursor(t *testing.T) {
 		t.Fatalf("repeated cursor accepted, calls=%d err=%v", calls, err)
 	}
 }
+
+func TestSearchTakenRangeKeepsBoundsAndMediaTypeOnEveryPage(t *testing.T) {
+	for _, cursor := range []bool{false, true} {
+		for _, isVideo := range []bool{false, true} {
+			t.Run(fmt.Sprintf("cursor=%t/video=%t", cursor, isVideo), func(t *testing.T) {
+				after := time.Date(2024, 1, 1, 23, 0, 0, 123000000, time.FixedZone("UTC+2", 7200))
+				before := after.Add(4 * time.Hour)
+				from, to := after.UTC().Format(time.RFC3339Nano), before.UTC().Format(time.RFC3339Nano)
+				kind, otherKind := "IMAGE", "VIDEO"
+				if isVideo {
+					kind, otherKind = otherKind, kind
+				}
+				calls := 0
+				c := reviewTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					calls++
+					var q map[string]any
+					if err := json.NewDecoder(r.Body).Decode(&q); err != nil {
+						t.Fatal(err)
+					}
+					if q["originalFileName"] != nil || q["createdAfter"] != nil || q["withExif"] != true || q["withStacked"] != true {
+						t.Fatalf("wrong capture date query: %v", q)
+					}
+					if cursor && calls == 2 {
+						filter := q["filter"].(map[string]any)
+						rangeFilter := filter["takenAt"].(map[string]any)
+						if q["cursor"] != "next" || q["page"] != nil || rangeFilter["gte"] != from || rangeFilter["lte"] != to || filter["type"].(map[string]any)["eq"] != kind {
+							t.Fatalf("cursor lost filters: %v", q)
+						}
+					} else if q["takenAfter"] != from || q["takenBefore"] != to || q["type"] != kind || q["page"] != float64(calls) {
+						t.Fatalf("page lost filters: %v", q)
+					}
+					asset := func(id string, date time.Time, typ string) map[string]any {
+						return map[string]any{"id": id, "originalFileName": id + ".jpg", "fileCreatedAt": date, "type": typ}
+					}
+					response := map[string]any{"items": []any{
+						asset("upper", before, kind), asset("lower", after, kind),
+						asset("too-late", before.Add(time.Nanosecond), kind),
+						asset("too-early", after.Add(-time.Nanosecond), kind),
+						asset("other-media", after, otherKind), asset("unknown-date", time.Time{}, kind),
+						asset("", after, kind),
+					}}
+					if calls == 1 {
+						if cursor {
+							response["nextCursor"] = "next"
+						} else {
+							response["nextPage"] = "2"
+						}
+					} else {
+						response["items"] = []any{asset("lower", after, kind), asset("middle", after.Add(time.Hour), kind)}
+					}
+					json.NewEncoder(w).Encode(map[string]any{"assets": response})
+				}))
+				assets, err := c.SearchTakenRange(context.Background(), after, before, isVideo)
+				if err != nil || calls != 2 || len(assets) != 3 {
+					t.Fatalf("unexpected date results: %+v %v calls=%d", assets, err, calls)
+				}
+				if assets[0].ID != "upper" || assets[1].ID != "lower" || assets[2].ID != "middle" {
+					t.Fatalf("invalid or duplicate date candidates: %+v", assets)
+				}
+			})
+		}
+	}
+}
+
+func TestSearchTakenRangeRejectsInvalidRange(t *testing.T) {
+	c := reviewTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("invalid date range made a request")
+	}))
+	now := time.Now()
+	for _, span := range [][2]time.Time{{{}, now}, {now, {}}, {now, now.Add(-time.Hour)}} {
+		if _, err := c.SearchTakenRange(context.Background(), span[0], span[1], false); err == nil {
+			t.Fatal("invalid date range accepted")
+		}
+	}
+}
+func TestSearchReviewAlbumAssetsPaginatesWithAlbumFilter(t *testing.T) {
+	for _, cursor := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cursor=%t", cursor), func(t *testing.T) {
+			calls := 0
+			c := reviewTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var q map[string]any
+				json.NewDecoder(r.Body).Decode(&q)
+				if r.Method != "POST" || r.URL.Path != "/api/search/metadata" || q["withStacked"] != true || q["size"] != float64(1000) || q["originalFileName"] != nil || q["takenAfter"] != nil {
+					t.Fatalf("wrong membership query: %v", q)
+				}
+				if cursor && calls == 2 {
+					filter := q["filter"].(map[string]any)["albumIds"].(map[string]any)["any"].([]any)
+					if q["cursor"] != "next" || q["page"] != nil || len(filter) != 1 || filter[0] != "album-1" {
+						t.Fatalf("cursor lost the destination album: %v", q)
+					}
+				} else {
+					ids := q["albumIds"].([]any)
+					if len(ids) != 1 || ids[0] != "album-1" || q["page"] != float64(calls) {
+						t.Fatalf("page lost the destination album: %v", q)
+					}
+				}
+				next := ""
+				if calls == 1 {
+					if cursor {
+						next = `,"nextCursor":"next"`
+					} else {
+						next = `,"nextPage":"2"`
+					}
+				}
+				fmt.Fprintf(w, `{"assets":{"items":[{"id":"a"},{"id":"page-%d"},{"id":""}]%s}}`, calls, next)
+			}))
+			assets, err := c.SearchReviewAlbumAssets(context.Background(), "album-1")
+			if err != nil || len(assets) != 3 || calls != 2 || assets[2].ID != "page-2" {
+				t.Fatalf("incomplete or duplicated membership: %+v %v calls=%d", assets, err, calls)
+			}
+		})
+	}
+}
+
+func TestSearchReviewAlbumAssetsRejectsIncompleteResults(t *testing.T) {
+	calls := 0
+	c := reviewTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			io.WriteString(w, `{"assets":{"items":[{"id":"a"}],"nextPage":"2"}}`)
+		} else {
+			io.WriteString(w, `{"error":"album not accessible"}`)
+		}
+	}))
+	assets, err := c.SearchReviewAlbumAssets(context.Background(), "album-1")
+	if err == nil || assets != nil || calls != 2 {
+		t.Fatalf("partial membership treated as complete: %+v %v calls=%d", assets, err, calls)
+	}
+	if _, err := c.SearchReviewAlbumAssets(context.Background(), ""); err == nil || calls != 2 {
+		t.Fatal("empty destination ID sent to Immich")
+	}
+}
+
 func TestCreateAlbumNeverRetriesServerFailure(t *testing.T) {
 	calls := 0
 	c := reviewTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; http.Error(w, "lost", 500) }))

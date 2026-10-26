@@ -22,9 +22,28 @@ import (
 
 type Library interface {
 	SearchOriginalFilename(context.Context, string) ([]immich.ReviewAsset, error)
+	SearchTakenRange(context.Context, time.Time, time.Time, bool) ([]immich.ReviewAsset, error)
 	GetAlbums(context.Context) ([]immich.Album, error)
+	SearchReviewAlbumAssets(context.Context, string) ([]immich.ReviewAsset, error)
 	CreateReviewAlbum(context.Context, string) (string, error)
 	AddReviewAssets(context.Context, string, []string) ([]string, error)
+}
+
+const dateFallbackTolerance = 2 * time.Hour
+
+type AlbumOption struct {
+	ID         string     `json:"id"`
+	Title      string     `json:"title"`
+	AssetCount *int       `json:"assetCount,omitempty"`
+	CreatedAt  *time.Time `json:"createdAt,omitempty"`
+}
+
+type ExistingAlbumError struct {
+	Albums []AlbumOption
+}
+
+func (e *ExistingAlbumError) Error() string {
+	return "An album with this title already exists. Choose an existing album to add the selected photos, or use a different title."
 }
 
 type Candidate struct {
@@ -45,16 +64,17 @@ type Item struct {
 	Candidates       []Candidate `json:"candidates"`
 }
 type Session struct {
-	ID        string            `json:"id"`
-	Title     string            `json:"title"`
-	CreatedAt time.Time         `json:"createdAt"`
-	Target    string            `json:"target"`
-	Status    string            `json:"status"`
-	Items     []Item            `json:"items"`
-	AlbumID   string            `json:"albumId,omitempty"`
-	Selected  map[string]string `json:"selected,omitempty"`
-	FailedIDs []string          `json:"failedIds,omitempty"`
-	Message   string            `json:"message,omitempty"`
+	ID            string            `json:"id"`
+	Title         string            `json:"title"`
+	CreatedAt     time.Time         `json:"createdAt"`
+	Target        string            `json:"target"`
+	Status        string            `json:"status"`
+	Items         []Item            `json:"items"`
+	AlbumID       string            `json:"albumId,omitempty"`
+	ExistingAlbum bool              `json:"existingAlbum,omitempty"`
+	Selected      map[string]string `json:"selected,omitempty"`
+	FailedIDs     []string          `json:"failedIds,omitempty"`
+	Message       string            `json:"message,omitempty"`
 }
 type Service struct {
 	Dir string
@@ -90,6 +110,11 @@ func (s *Service) Preview(ctx context.Context, album *googlephotos.Album, client
 	}
 	session := &Session{ID: hex.EncodeToString(id), Title: album.Title, CreatedAt: time.Now().UTC(), Target: target, Status: "ready", Items: []Item{}}
 	cache := map[string][]immich.ReviewAsset{}
+	type dateKey struct {
+		TakenAt time.Time
+		IsVideo bool
+	}
+	dateCache := map[dateKey][]immich.ReviewAsset{}
 	seen := map[string]bool{}
 	for _, photo := range album.Photos {
 		if photo.ID == "" || seen[photo.ID] {
@@ -126,6 +151,39 @@ func (s *Service) Preview(ctx context.Context, album *googlephotos.Album, client
 			item.Status = item.Candidates[0].DateStatus
 		} else if len(item.Candidates) > 1 {
 			item.Status = "ambiguous"
+		}
+		if len(item.Candidates) == 0 && !photo.TakenAt.IsZero() {
+			key := dateKey{TakenAt: photo.TakenAt.UTC(), IsVideo: photo.IsVideo}
+			alternatives, cached := dateCache[key]
+			if !cached {
+				var err error
+				alternatives, err = client.SearchTakenRange(ctx, photo.TakenAt.Add(-dateFallbackTolerance), photo.TakenAt.Add(dateFallbackTolerance), photo.IsVideo)
+				if err != nil {
+					return nil, fmt.Errorf("Immich capture date search failed: %w", err)
+				}
+				dateCache[key] = alternatives
+			}
+			seenAssets := map[string]bool{}
+			for _, asset := range alternatives {
+				taken := asset.TakenAt()
+				if asset.ID == "" || seenAssets[asset.ID] || taken.IsZero() || taken.Sub(photo.TakenAt).Abs() > dateFallbackTolerance {
+					continue
+				}
+				seenAssets[asset.ID] = true
+				item.Candidates = append(item.Candidates, Candidate{ID: asset.ID, Filename: asset.OriginalFileName, TakenAt: instant(taken), DateStatus: "nearby_date"})
+			}
+			sort.Slice(item.Candidates, func(i, j int) bool {
+				di := item.Candidates[i].TakenAt.Sub(photo.TakenAt).Abs()
+				dj := item.Candidates[j].TakenAt.Sub(photo.TakenAt).Abs()
+				if di == dj {
+					return item.Candidates[i].ID < item.Candidates[j].ID
+				}
+				return di < dj
+			})
+			if len(item.Candidates) > 0 {
+				item.Status = "date_suggestions"
+				item.Warning = "No exact filename match. These alternatives were taken within ±2 hours. Check the previews and select a photo manually."
+			}
 		}
 		session.Items = append(session.Items, item)
 	}
@@ -196,12 +254,93 @@ func (s *Service) Cancel(id, target string) (*Session, error) {
 		return nil, err
 	}
 	if session.Status != "ready" && session.Status != "cancelled" {
-		return session, fmt.Errorf("creation has already started; this preview cannot be cancelled")
+		return session, fmt.Errorf("the operation has already started; this preview cannot be cancelled")
 	}
 	session.Status = "cancelled"
 	return session, s.save(session)
 }
-func (s *Service) Confirm(ctx context.Context, id, target, title string, selected map[string]string, client Library) (*Session, error) {
+
+// CheckAlbums is read-only: the destination is still rechecked on confirmation.
+func (s *Service) CheckAlbums(ctx context.Context, id, target, title string, client Library) ([]AlbumOption, error) {
+	session, err := s.Get(id, target)
+	if err != nil {
+		return nil, err
+	}
+	if session.Status != "ready" || time.Since(session.CreatedAt) > 24*time.Hour {
+		return nil, fmt.Errorf("preview is no longer ready; generate it again")
+	}
+	title = strings.TrimSpace(title)
+	if title == "" || len(title) > 500 {
+		return nil, fmt.Errorf("enter an album title of at most 500 bytes")
+	}
+	return matchingAlbums(ctx, title, client)
+}
+
+// AlbumMembership exposes only candidate IDs from this preview, never unrelated
+// album contents. Choosing a destination here does not start an operation.
+func (s *Service) AlbumMembership(ctx context.Context, id, target, title, albumID string, client Library) ([]string, error) {
+	options, err := s.CheckAlbums(ctx, id, target, title, client)
+	if err != nil {
+		return nil, err
+	}
+	available := false
+	for _, option := range options {
+		if option.ID == albumID {
+			available = true
+			break
+		}
+	}
+	if !available {
+		return nil, fmt.Errorf("the selected album is no longer available with this title; check Immich and choose again")
+	}
+	session, err := s.Get(id, target)
+	if err != nil {
+		return nil, err
+	}
+	assets, err := client.SearchReviewAlbumAssets(ctx, albumID)
+	if err != nil {
+		return nil, err
+	}
+	allowed := map[string]bool{}
+	for _, item := range session.Items {
+		for _, candidate := range item.Candidates {
+			allowed[candidate.ID] = true
+		}
+	}
+	present := []string{}
+	for _, asset := range assets {
+		if allowed[asset.ID] {
+			present = append(present, asset.ID)
+			delete(allowed, asset.ID)
+		}
+	}
+	sort.Strings(present)
+	return present, nil
+}
+
+func matchingAlbums(ctx context.Context, title string, client Library) ([]AlbumOption, error) {
+	albums, err := client.GetAlbums(ctx)
+	if err != nil {
+		return nil, err
+	}
+	matches := []AlbumOption{}
+	seen := map[string]bool{}
+	for _, album := range albums {
+		if album.AlbumName != title {
+			continue
+		}
+		if album.Id == "" {
+			return nil, fmt.Errorf("Immich returned an album without a valid ID; check Immich before continuing")
+		}
+		if !seen[album.Id] {
+			matches = append(matches, AlbumOption{ID: album.Id, Title: album.AlbumName, AssetCount: album.AssetCount, CreatedAt: album.CreatedAt})
+			seen[album.Id] = true
+		}
+	}
+	return matches, nil
+}
+
+func (s *Service) Confirm(ctx context.Context, id, target, title string, selected map[string]string, existingAlbumID string, client Library) (*Session, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	session, err := s.load(id, target)
@@ -219,7 +358,10 @@ func (s *Service) Confirm(ctx context.Context, id, target, title string, selecte
 		return session, fmt.Errorf("creation outcome is uncertain; check Immich before creating another album")
 	}
 	if session.Status != "ready" && (title != session.Title || !reflect.DeepEqual(selected, session.Selected)) {
-		return session, fmt.Errorf("a started creation cannot change title or selection")
+		return session, fmt.Errorf("a started operation cannot change title or selection")
+	}
+	if session.Status != "ready" && existingAlbumID != "" && (!session.ExistingAlbum || existingAlbumID != session.AlbumID) {
+		return session, fmt.Errorf("a started operation cannot change its destination album")
 	}
 	if session.Status == "complete" {
 		return session, nil
@@ -250,32 +392,45 @@ func (s *Service) Confirm(ctx context.Context, id, target, title string, selecte
 	}
 	sort.Strings(ids)
 	if session.Status == "ready" {
-		albums, err := client.GetAlbums(ctx)
-		if err != nil {
-			return session, err
-		}
-		for _, album := range albums {
-			if album.AlbumName == title {
-				return session, fmt.Errorf("an album with this title already exists; choose a different title")
-			}
-		}
 		session.Title = title
-		session.Selected = selected
-		session.Status = "creating"
-		if err := s.save(session); err != nil {
+		matches, err := matchingAlbums(ctx, title, client)
+		if err != nil {
 			return session, err
 		}
-		albumID, err := client.CreateReviewAlbum(ctx, title)
-		if err != nil {
-			session.Status = "creation_unknown"
-			session.Message = "Check Immich: the server may have created the album. No automatic retry."
-			_ = s.save(session)
-			return session, fmt.Errorf("album creation outcome is uncertain; check Immich")
+		seenAlbums := map[string]bool{}
+		for _, album := range matches {
+			seenAlbums[album.ID] = true
 		}
-		session.AlbumID = albumID
+		if existingAlbumID == "" && len(matches) > 0 {
+			return session, &ExistingAlbumError{Albums: matches}
+		}
+		if existingAlbumID != "" && !seenAlbums[existingAlbumID] {
+			return session, fmt.Errorf("the selected album is no longer available with this title; check Immich and choose again")
+		}
+		session.Selected = selected
+		if existingAlbumID == "" {
+			session.Status = "creating"
+			if err := s.save(session); err != nil {
+				return session, err
+			}
+			albumID, err := client.CreateReviewAlbum(ctx, title)
+			if err != nil {
+				session.Status = "creation_unknown"
+				session.Message = "Check Immich: the server may have created the album. No automatic retry."
+				_ = s.save(session)
+				return session, fmt.Errorf("album creation outcome is uncertain; check Immich")
+			}
+			session.AlbumID = albumID
+		} else {
+			session.AlbumID = existingAlbumID
+			session.ExistingAlbum = true
+		}
 		session.Status = "adding"
 		if err := s.save(session); err != nil {
-			return session, fmt.Errorf("album %s created, but journal could not be saved: %w", albumID, err)
+			if !session.ExistingAlbum {
+				return session, fmt.Errorf("album %s created, but journal could not be saved: %w", session.AlbumID, err)
+			}
+			return session, fmt.Errorf("cannot save the operation for album %s; no photos were added: %w", session.AlbumID, err)
 		}
 	}
 	if session.AlbumID == "" {
@@ -285,10 +440,10 @@ func (s *Service) Confirm(ctx context.Context, id, target, title string, selecte
 	session.FailedIDs = failed
 	if addErr != nil {
 		session.Status = "partial"
-		session.Message = "Album created. Retry to add the selected photos to the same album."
+		session.Message = "Some photos were not added. Retry to add the selected photos to the same album."
 	} else {
 		session.Status = "complete"
-		session.Message = "Album created with the selected existing photos."
+		session.Message = "The selected photos are in the album. Photos already in the album were kept."
 	}
 	if err := s.save(session); err != nil {
 		return session, err
